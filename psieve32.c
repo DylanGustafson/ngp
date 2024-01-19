@@ -1,3 +1,5 @@
+//Dylan G.
+//Generates all primes below 2^32 and store them in binary
 #include <stdio.h>
 #include <stdlib.h>
 //#include <omp.h>
