@@ -1,4 +1,5 @@
-//Queneau searching program by Dylan G.
+//Dylan G.
+//Finds the minimum primitive root a of each [long] prime p, and calculates [long] ((a ^ (p - 1) % p^2) - 1) / p
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
