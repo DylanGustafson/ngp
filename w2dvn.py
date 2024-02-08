@@ -65,9 +65,9 @@ A,B = generate_matrices(True)
 
 tmax = 200
 Z = [np.zeros(n * m)]
-Z += [np.zeros(n * m)]
 r2 = (X-0.5) ** 2 + (Y-0.3) ** 2
-#Z += [0.2 * (np.exp(-20 * r2)).flatten()]# * (1-20*r2)).flatten()]
+Z += [0.2 * (np.exp(-20 * r2)).flatten()]# * (1-20*r2)).flatten()]
+#Z += [np.zeros(n * m)]
 
 for t in range(2, tmax):
     Z += [ A * Z[t-1] - B * Z[t-2] ]
