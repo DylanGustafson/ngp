@@ -72,9 +72,8 @@ Z += [0.2 * (np.exp(-20 * r2)).flatten()]# * (1-20*r2)).flatten()]
 for t in range(2, tmax):
     Z += [ A * Z[t-1] - B * Z[t-2] ]
 
-    ##Add periodic wave source
-    #if vn:
-    Z[t] += 0.01*np.exp(-30 * ((X-0.2) ** 2 + (Y-0.5) ** 2)).flatten() * np.sin((t-2)/8)
+    #Add periodic wave source
+    #Z[t] += 0.01*np.exp(-30 * ((X-0.2) ** 2 + (Y-0.5) ** 2)).flatten() * np.sin((t-2)/8)
 
 def change_plot(j, Z, plot):
    plot[0].remove()
