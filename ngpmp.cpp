@@ -1,4 +1,4 @@
-//Non-Generous Prime search by Dylan G.
+//Queneau searching program by Dylan G.
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
