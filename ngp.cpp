@@ -1,5 +1,4 @@
-//Dylan G.
-//Finds the minimum primitive root a of each [long] prime p, and calculates [long] ((a ^ (p - 1) % p^2) - 1) / p
+//Queneau searching program by Dylan G.
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
@@ -18,20 +17,6 @@ int max_pfacs;
 long offset(const long a, const long b)
 {
     return (b - a % b) % b;
-}
-
-//Calculates [a^n mod b] in O(log n) time
-__int128 powmod(__int128 a, long n, const long b)
-{
-    __int128 res = 1;
-    while (n > 0)
-    {
-        if (n & 1)
-            res = res * a % b;
-        a = a * a % b;
-        n >>= 1;
-    }
-    return res;
 }
 
 //Calculates ((a ^ (p - 1) % p^2) - 1) / p, with 64-bit inputs
@@ -171,13 +156,21 @@ void gen_exps(const long chunk_start, char* candidates, std::vector<long>* exp_v
     }
 }
 
-char chk_pr(const long root, const long modulo, const long *exp_diffs, const int vsize)
+char chk_pr(const long root, const long modulo, const long *exponents, const int vsize)
 {
-    __int128 res_prev = 1;
-    for(int i = 0; i < vsize; i++)
+    long n;
+    __int128 acc, res;
+    for(int i = vsize - 1; i >= 0; i--)
     {
-        res_prev = (res_prev * powmod(root, exp_diffs[i], modulo)) % modulo;
-        if(res_prev == 1)
+        res = 1;
+        acc = root;
+        for(n = exponents[i]; n > 0; n >>= 1)
+        {
+            if (n & 1)
+                res = res * acc % modulo;
+            acc = acc * acc % modulo;
+        }
+        if(res == 1)
             return 0;
     }
 
@@ -232,35 +225,23 @@ void find_mprs(const long chunk_start)
         modulo = 2 * (chunk_start + j) + 1;
 
         //Skip factor product in first slot unless N-1 is unusual
-        vstart = 1;
-        if(exp_vals[j][0] != modulo - 1)
+        vstart = 0;
+        if(exp_vals[j][0] == modulo - 1)
         {
-            vsize++;
-            vstart = 0;
+            vsize--;
+            vstart = 1;
         }
 
-        //Create vector of differences between (N-1)/p value to make powmod faster
-        exp_prev = 0;
-        for(i = 0; i < vsize - 1; i++)
-        {
-            exp_diffs[i] = exp_vals[j][vstart + i] - exp_prev;
-            exp_prev = exp_vals[j][vstart + i];
-        }
+        //Create static vector of exponents with space pre-allocated for final (N-1)/2
+        for(i = 0; i < vsize; i++)
+            exp_diffs[i] = exp_vals[j][vstart + i];
 
         //Last (N-1)/p value is when p=2, which wasnt actually stored since its just n
-        exp_diffs[vsize - 1] = chunk_start + j - exp_prev;
-
-        exp_prev = 0;
-        printf("\n%li: ", modulo);
-        for(i = 0; i < vsize; i++)
-        {
-            exp_prev += exp_diffs[i];
-            printf("%li ", exp_prev);
-        }
+        exp_diffs[vsize] = chunk_start + j;
 
         //Find first primitive root of N
         for(root = 2; root < modulo; root++)
-            if(chk_pr(root, modulo, exp_diffs, vsize))
+            if(chk_pr(root, modulo, exp_diffs, vsize + 1))
                 break;
 
         //Calculate residue ((root^(N - 1) % N^2) - 1) / N, and print everything
