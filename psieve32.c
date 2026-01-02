@@ -3,12 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-//#include <omp.h>
 
 const char* output_name = "primes.dat";
-uint32_t static_primes[] = { 3,  5,  7, 11, 13, 17, 19, 23,
-                        29, 31, 37, 41, 43, 47, 53, 59, 61,
-                        67, 71, 73, 79, 83, 89, 97,101,103,
+uint32_t static_primes[] = {  3,  5,  7, 11, 13, 17, 19, 23,
+                         29, 31, 37, 41, 43, 47, 53, 59, 61,
+                         67, 71, 73, 79, 83, 89, 97,101,103,
                         107,109,113,127,131,137,139,149,151,
                         157,163,167,173,179,181,191,193,197,
                         199,211,223,227,229,233,239,241,251};
@@ -21,7 +20,6 @@ uint32_t rule_out(const uint32_t* pfacs, const uint32_t n, char* skip, const uin
     {
         p = pfacs[i];
 
-        //#pragma omp parallel for
         for(j = (3 * p - 1) / 2; j < max; j += p)
             skip[j] = 1;
     }
@@ -63,11 +61,11 @@ int main(int argc, char* argv[])
     puts("Finished sieve 1, starting sieve 2"); fflush(stdout);
     uint32_t total_32 = rule_out(dynamic_primes, total_16, skip, 0x80000000);
     free(dynamic_primes);
-
+    
     puts("Finished sieve 2, writing to file"); fflush(stdout);
-
     total_32++;
     fwrite(&total_32, sizeof(uint32_t), 1, outfile);
+    
     p = 2;
     fwrite(&p, sizeof(uint32_t), 1, outfile);
 

@@ -8,7 +8,7 @@ fi
 
 echo "Running $x..."
 a=$(date +%s.%N)
-$x $2 $3 $4 > out.csv
+$x $2 $3 $4 > out.txt
 b=$(date +%s.%N)
 
 echo Total time\: $(echo "$b-$a" | bc) seconds
