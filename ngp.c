@@ -2,8 +2,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/sysinfo.h>
 #include <gmp.h>
-//#include <omp.h>
+#include <omp.h>
 
 #define INIT_ALLOC 8 //Initial allocation: 6 prime factors (1 stdev above mean)
 #define MID_ALLOC 12 //Mid allocation: 10 prime factors (3 stdev's above mean)
@@ -27,21 +28,21 @@ uint32_t* primes;
 uint32_t max_pfacs;
 uint32_t output_format;
 
-//
+//256-bit values private to each thread
 mpz_t g_a, g_b;
 #pragma omp threadprivate(g_a)
 #pragma omp threadprivate(g_b)
 
-///*
+/*
 void print_vec(uint64_t* arr_p) {
     printf("[");
     for(size_t i = 0; i < *arr_p; i++) {
-        printf("%llu", *(arr_p + i));
+        printf("%lu", *(arr_p + i));
         if (i + 1 < *arr_p) printf(", ");
     }
     printf("]\n");
 }
-//*/
+*/
 
 //Returns the positive offset of the first number after 'a' divisible by 'b' (returns 0 if b divides a)
 uint64_t offset(const uint64_t a, const uint64_t b)
@@ -50,7 +51,7 @@ uint64_t offset(const uint64_t a, const uint64_t b)
 }
 
 //Performs a sieve of eratosthenes on the chunk. Returns the number of primes needed to do so.
-void prime_sieve(const uint64_t chunk_start, uint64_t** candidates)
+void prime_sieve(const uint64_t chunk_start, uint64_t** vectors)
 {
     uint32_t i, p;
     uint64_t j, N_min, N_max, mstart;
@@ -73,12 +74,12 @@ void prime_sieve(const uint64_t chunk_start, uint64_t** candidates)
 
         //Set false in every position divisible by p
         for(j = mstart; j < chunk_size; j += p)
-            if(candidates[j])
-                candidates[j] = 0;
+            if(vectors[j])
+                vectors[j] = 0;
     }
 }
 
-void gen_exps(const uint64_t chunk_start, uint64_t** candidates)
+void gen_exps(const uint64_t chunk_start, uint64_t** vectors)
 {
     uint32_t i, p;
     uint64_t j, first_pos, chunk_max, half_exp_val, newcap;
@@ -106,24 +107,24 @@ void gen_exps(const uint64_t chunk_start, uint64_t** candidates)
             for(j = first_pos; j < chunk_size; j += p)
             {
                 half_exp_val++;
-                if(!candidates[j]) continue;
+                if(!vectors[j]) continue;
 
                 //update fprod (first element of each vector)
-                candidates[j][2] *= p;
+                vectors[j][2] *= p;
 
                 //Push back prime factor value onto vector
-                if (candidates[j][0] == candidates[j][1]) {
-                    //printf("Reallocating for %llu:\t%llu -> %llu\n", 2*(chunk_start + j) + 1, candidates[j][1], candidates[j][1]*MULT);
-                    //candidates[j] = (uint64_t*) realloc(candidates[j], candidates[j][1] * MULT * sizeof(uint64_t));
-                    //candidates[j][1] *= MULT;
-                    newcap = (candidates[j][1] == INIT_ALLOC) ? MID_ALLOC : MAX_ALLOC;
+                if (vectors[j][0] == vectors[j][1]) {
+                    //printf("Reallocating for %llu:\t%llu -> %llu\n", 2*(chunk_start + j) + 1, vectors[j][1], vectors[j][1]*MULT);
+                    //vectors[j] = (uint64_t*) realloc(vectors[j], vectors[j][1] * MULT * sizeof(uint64_t));
+                    //vectors[j][1] *= MULT;
+                    newcap = (vectors[j][1] == INIT_ALLOC) ? MID_ALLOC : MAX_ALLOC;
 
-                    candidates[j] = (uint64_t*) realloc(candidates[j], newcap * sizeof(uint64_t));
-                    candidates[j][1] = newcap;
+                    vectors[j] = (uint64_t*) realloc(vectors[j], newcap * sizeof(uint64_t));
+                    vectors[j][1] = newcap;
                 }
 
-                candidates[j][candidates[j][0]] = 2 * half_exp_val;
-                candidates[j][0] += 1;
+                vectors[j][vectors[j][0]] = 2 * half_exp_val;
+                vectors[j][0] += 1;
             }
         }
 
@@ -141,8 +142,8 @@ void gen_exps(const uint64_t chunk_start, uint64_t** candidates)
 
             //Tertiary loop: Update fprods (first element of each vector)
             for(j = first_pos; j < chunk_size; j += divisor)
-                if(candidates[j])
-                    candidates[j][2] *= p;
+                if(vectors[j])
+                    vectors[j][2] *= p;
         }
     }
 }
@@ -217,18 +218,18 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer)
     uint64_t j, modulo, root, residue, entry_index, fprod;
     uint64_t *exp_start, *exp_end;
 
-    uint64_t** candidates = (uint64_t**) malloc(chunk_size * sizeof(uint64_t*));
+    uint64_t** vectors = (uint64_t**) malloc(chunk_size * sizeof(uint64_t*));
     for(j = 0; j < chunk_size; j++)
-        candidates[j] = (uint64_t*) 1;
+        vectors[j] = (uint64_t*) 1;
 
     //Sieve out numbers where 2n+1 is composite
     //puts("Sieving primes"); fflush(stdout);
-    prime_sieve(chunk_start, candidates);
+    prime_sieve(chunk_start, vectors);
 
     //Count number of entries in chunk
     uint32_t count = 0;
     for(j = 0; j < chunk_size; j++)
-        if(candidates[j])
+        if(vectors[j])
             count++;
 
     //Allocate memory for list of entries before creating exponent vectors
@@ -238,20 +239,20 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer)
     //std::vector<uint64_t>* exp_vecs = new std::vector<uint64_t>[chunk_size];
 
     for(j = 0; j < chunk_size; j++) {
-        if(!candidates[j])
+        if(!vectors[j])
             continue;
 
-        candidates[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(int64_t));
-        candidates[j][0] = 3;
-        candidates[j][1] = INIT_ALLOC;
-        candidates[j][2] = 1;
+        vectors[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(int64_t));
+        vectors[j][0] = 3;
+        vectors[j][1] = INIT_ALLOC;
+        vectors[j][2] = 1;
 
         //printf("Allocated vector %llu: %llu --> %llu, %llu\n", (uint64_t)i, (uint64_t)arr_pp[i], arr_pp[i][0], arr_pp[i][0]);
     }
 
     //Fill vectors with (N-1)/p values for each prime number N
     //puts("Factoring"); fflush(stdout);
-    gen_exps(chunk_start, candidates);
+    gen_exps(chunk_start, vectors);
 
     //Initialize 256-bit integer structs
     mpz_init(g_a);
@@ -262,36 +263,36 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer)
     entry_index = 0;
     for(j = 0; j < chunk_size; j++)
     {
-        if(!candidates[j]) continue;
+        if(!vectors[j]) continue;
 
-        print_vec(candidates[j]);
+        //print_vec(vectors[j]);
 
         //Calculate the test prime N
         modulo = 2 * (chunk_start + j) + 1;
-        vsize = candidates[j][0];
+        vsize = vectors[j][0];
 
         //fprod is just N-1, meaning all prime factors of N-1 are less than sqrt(N-1)
         //In this case, simply overwrite fprod with the first exponent, (N-1)/2
 
-        exp_start = candidates[j] + 2;
-        exp_end = candidates[j] + vsize;
+        exp_start = vectors[j] + 2;
+        exp_end = vectors[j] + vsize;
 
-        if(candidates[j][2] != chunk_start + j)
+        if(vectors[j][2] != chunk_start + j)
         {
-            fprod = candidates[j][2] * 2;
+            fprod = vectors[j][2] * 2;
 
-            if(candidates[j][1] > vsize) {
-                candidates[j][vsize] = fprod;
-                candidates[j][2] = chunk_start + j;
+            if(vectors[j][1] > vsize) {
+                vectors[j][vsize] = fprod;
+                vectors[j][2] = chunk_start + j;
                 exp_end += 1;
             }
             else
             {
                 for(i = 2; i < vsize - 2; i++)
-                    candidates[j][i] = candidates[j][i + 1];
+                    vectors[j][i] = vectors[j][i + 1];
 
-                candidates[j][vsize - 1] = fprod;
-                candidates[j][1] = chunk_start + j;
+                vectors[j][vsize - 1] = fprod;
+                vectors[j][1] = chunk_start + j;
                 exp_start -= 1;
             }
         }
@@ -303,25 +304,22 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer)
         residue = get_residue(root, modulo);
 
         if(residue == 0)
-            fprintf(stderr, "Non-generous prime found! Value = %llu\n", modulo);
-
-        //if(root > 0xFFFFFFFF)
-        //    printf("Large root! -- Prime: %llu\t\tRoot: %3llu\tA: %llu\n", modulo, root, residue);
+            fprintf(stderr, "Non-generous prime found! Value = %lu\n", modulo);
 
         entries[entry_index].prime = modulo;
         entries[entry_index].root = root;
         entries[entry_index].residue = residue;
         entry_index++;
 
-        free(candidates[j]);
+        free(vectors[j]);
     }
 
-    //Get 256-bit integers
+    //Garbage collect 256-bit integers
     mpz_clear(g_a);
     mpz_clear(g_b);
 
     //Garbage collect and return
-    free(candidates);
+    free(vectors);
 
     *count_pointer = count;
     return entries;
@@ -330,6 +328,7 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer)
 void load_primes(uint64_t Nmax)
 {
     uint32_t i, pfile_count;
+    size_t fread_out;
 
     //Open primes.dat to get primes needed for sieve
     FILE* pfile = fopen(primes_file, "rb");
@@ -340,25 +339,24 @@ void load_primes(uint64_t Nmax)
     }
 
     //First 4 bytes is total number of primes
-    fread(&pfile_count, sizeof(uint32_t), 1, pfile);
-    primes = (uint32_t*) malloc(pfile_count * sizeof(uint32_t));
-
-    for(i = 0; i < pfile_count; i++)
-    {
-        fread(&primes[i], sizeof(uint32_t), 1, pfile);
-        if((uint64_t)primes[i] * primes[i] > Nmax)
-            break;
-    }
-
-    fclose(pfile);
-    if(i > pfile_count)
-    {
-        fprintf(stderr, "Error: Not enough primes in %s\n", primes_file);
-        free(primes);
+    if(fread(&pfile_count, sizeof(uint32_t), 1, pfile) != 1) {
+        fprintf(stderr, "Format error in \"%s\"\n", primes_file);
         exit(1);
     }
+    
+    //The rest of the file is loaded straight into the array in 4KB increments
+    primes = (uint32_t*) malloc(pfile_count * sizeof(uint32_t));
+    max_pfacs = 0;
+    while(max_pfacs < pfile_count) {
+        max_pfacs += fread(&primes[max_pfacs], sizeof(uint32_t), 1024, pfile);
+        
+        //Break when p^2 is larger than the largest value in the block
+        if((uint64_t) primes[max_pfacs - 1] * primes[max_pfacs - 1] > Nmax)
+            break;
+    }
+    fclose(pfile);
 
-    max_pfacs = i;
+    //Truncate primes array (if possible) to free up memory for next steps
     primes = (uint32_t*) realloc(primes, max_pfacs * sizeof(uint32_t));
 }
 
@@ -371,17 +369,18 @@ int main(int argc, char **argv)
     uint64_t j;
     uint32_t num_chunks;
 
-    char fcsv[] = "%llu,%llu,%llu\n";
-    char fstdout[] = "Prime: %19llu    Root:%4llu    Residue: %llu\n";
+    char fcsv[] = "%lu,%lu,%lu\n";
+    char fstdout[] = "Prime: %19lu    Root:%4lu    Residue: %lu\n";
     char* output = fstdout;
 
     if(argc < 4) {
-        printf("64-Bit Non-Generous Prime Searcher by Dylan G.\n\n");
-        printf("Usage: ngp [-cbs] start_value total_size chunk_size\n");
-        printf("   -c: Format output as csv (base 10)\n");
-        printf("// -b: Format output as binary\n");
-        printf("// -s: Silent search, no output to stdout\n");
+        puts("64-Bit Non-Generous Prime Searcher by Dylan G.\n");
+        puts("Usage: ngp [-cbs] start_value total_size chunk_size");
+        puts("   -c: Format output as csv (base 10)");
+        puts("// -b: Format output as binary");
+        puts("// -s: Silent search, no output to stdout");
         return 0;
+        
     } else if(argc > 4 && argv[1][1] == 'c') {
         output = fcsv;
     }
@@ -397,9 +396,21 @@ int main(int argc, char **argv)
     num_chunks = block_size / chunk_size;
     archive** lists = (archive**) malloc(num_chunks * sizeof(archive*));
     uint32_t* counts = (uint32_t*) malloc(num_chunks * sizeof(uint32_t));
+    
+    struct sysinfo info;
+    if (sysinfo(&info) != 0) {
+        perror("sysinfo");
+        return 1;
+    }
+    
+    //Check RAM size against rough prediction of usage
+    if(chunk_size * INIT_ALLOC + 1e9 > info.totalram / omp_get_num_threads()) {
+        fprintf(stderr, "Error - insufficient system memory. Try a smaller chunk size.\n");
+        return 1;
+    }
 
     //Use OpenMP to split chunks among threads
-    //#pragma omp parallel for
+    #pragma omp parallel for
     for(uint32_t i = 0; i < num_chunks; i++)
         lists[i] = find_mprs(start + i * chunk_size, &counts[i]);
 
