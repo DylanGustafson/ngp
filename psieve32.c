@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#define BLOCK_SIZE 0x8000
 
 const char* output_name = "primes.dat";
 uint32_t static_primes[] = {  3,  5,  7, 11, 13, 17, 19, 23,
@@ -20,7 +21,7 @@ uint32_t rule_out(const uint32_t* pfacs, const uint32_t n, char* skip, const uin
     {
         p = pfacs[i];
 
-        for(j = (3 * p - 1) / 2; j < max; j += p)
+        for(j = (p * p - 1) / 2; j < max; j += p)
             skip[j] = 1;
     }
 
@@ -34,7 +35,8 @@ uint32_t rule_out(const uint32_t* pfacs, const uint32_t n, char* skip, const uin
 
 int main(int argc, char* argv[])
 {
-    uint32_t i, j, p;
+    uint32_t pblock[BLOCK_SIZE];
+    uint32_t count, j, p;
 
     FILE* outfile = fopen(output_name, "wb");
     if(outfile == NULL)
@@ -49,16 +51,16 @@ int main(int argc, char* argv[])
     uint32_t total_16 = rule_out(static_primes, sizeof(static_primes)/sizeof(uint32_t), skip, 0x8000);
     uint32_t* dynamic_primes = (uint32_t*) malloc(total_16 * sizeof(uint32_t));
 
-    i = 0;
+    count = 0;
     for(j = 0; j < 0x8000; j++)
     {
         if(skip[j]) continue;
 
-        dynamic_primes[i] = 2 * j + 1;
-        i++;
+        dynamic_primes[count] = 2 * j + 1;
+        count++;
     }
 
-    puts("Finished sieve 1, starting sieve 2"); fflush(stdout);
+    puts("Starting sieve 2"); fflush(stdout);
     uint32_t total_32 = rule_out(dynamic_primes, total_16, skip, 0x80000000);
     free(dynamic_primes);
     
@@ -69,13 +71,19 @@ int main(int argc, char* argv[])
     p = 2;
     fwrite(&p, sizeof(uint32_t), 1, outfile);
 
+    count = 0;
     for(j = 0; j < 0x80000000; j++)
     {
         if(skip[j]) continue;
 
-        p = 2 * j + 1;
-        fwrite(&p, sizeof(uint32_t), 1, outfile);
+        pblock[count] = 2 * j + 1;
+        count++;
+        if(count < BLOCK_SIZE) continue;
+
+        fwrite(pblock, sizeof(uint32_t), BLOCK_SIZE, outfile);
+        count = 0;
     }
+    fwrite(pblock, sizeof(uint32_t), count, outfile);
 
     free(skip);
     fclose(outfile);
