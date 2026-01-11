@@ -2,14 +2,19 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/sysinfo.h>
-#include <gmp.h>
-#include <omp.h>
-#include <string.h>
+#include <string.h>         //only needed for memmove
+#include <gmp.h>            //GNU multiprecision arithmetic
+#include <omp.h>            //OpenMP
 
-#define INIT_ALLOC 8 //Initial vector allocation: 6 prime factors (1 stdev above mean)
-#define MID_ALLOC 12 //Mid allocation: 10 prime factors (3 stdev's above mean)
-#define MAX_ALLOC 17 //Maximum possible (15) distinct prime factors for 64-bit value (ex: 693386350578511591)
+#ifdef __APPLE__
+  #include <sys/sysctl.h>   //MacOS-specific
+#else
+  #include <sys/sysinfo.h>  //Linux-specific
+#endif
+
+#define INIT_ALLOC 8  //Initial vector allocation: 6 prime factors (1 stdev above mean)
+#define MID_ALLOC 12  //Mid allocation: 10 prime factors (3 stdev's above mean)
+#define MAX_ALLOC 17  //Maximum possible (15) distinct prime factors for 64-bit value (ex: 693386350578511591)
 
 typedef unsigned __int128 uint128_t;
 
@@ -33,6 +38,67 @@ uint32_t output_format;
 mpz_t g_a, g_b;
 #pragma omp threadprivate(g_a)
 #pragma omp threadprivate(g_b)
+
+//Overstimates n/ln(n) using simple integer math
+uint64_t noln(uint64_t n) {
+    //log2(n) approximated using clzll, 1/ln(2) approximated as 1.5
+    n /= (64 - __builtin_clzll(n));
+    return n + n / 2;
+}
+
+//Reads in primes below 2^32 from primes.dat
+void load_primes(uint64_t N_max) {
+    uint32_t pfile_size, max_read, pmax;
+    int mag;
+
+    //fprintf(stderr, "Loading primes\n"); fflush(stderr);
+    //Open primes.dat to get primes needed for sieve
+    FILE* pfile = fopen(primes_file, "rb");
+    if(pfile == NULL) {
+        fprintf(stderr, "Error: could not find \"%s\" - run ./psieve first\n", primes_file);
+        exit(1);
+    }
+
+    //First 4 bytes is total number of primes
+    if(fread(&pfile_size, sizeof(uint32_t), 1, pfile) != 1) {
+        fprintf(stderr, "Format error in \"%s\"\n", primes_file);
+        exit(1);
+    }
+
+    //Allocate intial space for primes
+    primes = (uint32_t*) malloc(pfile_size * sizeof(uint32_t));
+
+    //Calculate pmax as a rough overestimate of sqrt(N_max)
+    if(!__builtin_clzll(N_max))
+        //Linear approximation of sqrt(x) near 4294967296
+        pmax = 0x80000000 + (N_max >> 33);
+    else {
+        //Find closet power of 2 to sqrt(N_max), then do a Newton iteration
+        mag = (64 - __builtin_clzll(N_max)) / 2;
+        pmax = ((uint32_t)1 << (mag - 1)) + (uint32_t)(N_max >> (mag + 1));
+    }
+    pmax = pmax / 2 + N_max / pmax / 2;   //One final iteration, avoiding overflow
+
+    //Read pfile in 4KB blocks until primes are getting larger than pmax
+    max_read = 0;
+    while(max_read < pfile_size) {
+        max_read += fread(&primes[max_read], sizeof(uint32_t), 1024, pfile);
+
+        //Break when final prime is greater or equal to sqrt(N_max)
+        if(primes[max_read - 1] >= pmax)
+            break;
+    }
+    fclose(pfile);
+
+    //Find the actual index of first prime larger than pmax
+    for(max_pfacs = max_read; max_pfacs >= max_read - 1024; --max_pfacs)
+        if(primes[max_pfacs - 2] <= pmax)
+            break;
+
+    //Truncate primes array to free up memory for next steps
+    primes = (uint32_t*) realloc(primes, max_pfacs * sizeof(uint32_t));
+    //fprintf(stderr, "%u\n", primes[max_pfacs - 1]);
+}
 
 //Performs a sieve of eratosthenes on the chunk by setting vector pointers to null
 void prime_sieve(const uint64_t chunk_start, uint64_t** vectors) {
@@ -63,7 +129,7 @@ void prime_sieve(const uint64_t chunk_start, uint64_t** vectors) {
     }
 }
 
-//For each N, fill up vectors with (N-1)/p values, where p is prime factors of N-1
+//For each N, fills up vectors with (N-1)/p values, where p is each prime factor of N-1
 void gen_exps(const uint64_t chunk_start, uint64_t** vectors) {
     uint32_t i, p;
     uint64_t j, first_pos, N1_max, exp_val, newcap, divisor;
@@ -169,40 +235,61 @@ uint64_t mod_inv64(uint64_t a) {
     return s2;
 }
 
-//Multiplication reduction process for Montgomery modular multiplication
-uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t pi) {
-    int32_t chk_carry;
+//Multiplication reduction subroutine for Montgomery modular multiplication
+uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t p_i) {
+    uint64_t result;
 
-    //Calculate p * (n * pi % 2^64)
-    uint128_t q = (uint128_t) p * (uint64_t)(n * pi);
+    //Calculate p * (n * p_i % 2^64)
+    uint128_t q = (uint128_t) p * (uint64_t)(n * p_i);
 
-    //Add this result to the input n. This 128-bit sum can overflow!
-    uint128_t sum = q + n;
+    //arm64-specific instructions for efficiently calculating ((q + n) >> 64) % p
+    #if defined(__aarch64__)
+        asm volatile(
+            "adds     x5, %[ql], %[nl]\n\t"     // 128-bit addition of q and n, which stores
+            "adcs     x6, %[qh], %[nh]\n\t"     // (q+n)>>64 into x6 and affects carry flag
+            "sub      x5, x6, %[p]\n\t"         //Save ((q+n)>>64) - p into x5 in case it's needed
+            "ccmp     x6, %[p], 2, cc\n\t"      //If q+n didnt carry, check if x6 > p, otherwise set carry
+            "csel     %[res], x5, x6, hi"       //If x6 > p (or carry flag had been cleared), subtract p
+            : [res] "=r" (result)
+            : [ql] "r" ((uint64_t) q),
+              [qh] "r" ((uint64_t) (q >> 64)),
+              [nl] "r" ((uint64_t) n),
+              [nh] "r" ((uint64_t) (n >> 64)),
+              [p]  "r" (p)
+            : "x5", "x6"                        //Since x0 - x3 are input args and x4 was used to calculate q
+        );
 
-    //Need to save the state of the carry flag resulting from the sum above.
-    //The sbb instruction sets eax to 0 if C is not set, but -1 if C is set.
-    //By storing this result in chk_carry, we can include this as a necessary
-    //condition to subtract p from the total at the end.
-    //There are ways to do this without asm but this is more efficient!
-    asm volatile(
-        "sbb %%eax, %%eax\n\t"
-        "mov %%eax, %0"
-        : "=r" (chk_carry)      //Store result in chk_carry (likely edx)
-        : "r" (sum)             //Must happen after sum is computed
-        : "%eax"
-    );
+    //x86-64 specific instructions for ((q + n) >> 64) % p: just need to save carry flag into %eax
+    #else
+        //Adding q and n. This 128-bit sum can overflow!
+        uint128_t sum = q + n;
 
-    //Divide the sum by 2^64 (get most significant 64-bit word)
-    uint64_t result = sum >> 64;
+        //Need to save the state of the carry flag resulting from the sum above.
+        //The sbb instruction sets eax to 0 if C is not set, but -1 if C is set.
+        //By storing this result in chk_carry, we can include this as a necessary
+        //condition to subtract p from the total at the end.
+        int32_t chk_carry;
+        asm volatile(
+            "sbb %%eax, %%eax\n\t"  //Essentially: Set %eax to zero then subtract carry
+            "mov %%eax, %0"         //Save %eax
+            : "=r" (chk_carry)      //Store 32-bit result in chk_carry (likely edx)
+            : "r" (sum)             //Must happen after sum is computed
+            : "%eax"
+        );
 
-    //Subtract p if the result is greater than p or the 128-bit sum overflowed
-    if(result >= p || chk_carry == -1)
-        result -= p;
+        //Divide the sum by 2^64 (get most significant 64-bit word)
+        result = sum >> 64;
+
+        //Subtract p if the result is greater than p or the 128-bit sum overflowed
+        if(result >= p || chk_carry == -1)
+            result -= p;
+
+    #endif
 
     return result;
 }
 
-//Find the smallest positive primitive root of modulo (prime) using list of trial exponents.
+//Finds the smallest positive primitive root of prime modulo using list of trial exponents.
 uint64_t get_min_pr(const uint64_t p, const uint64_t* const exp_start, const uint64_t* const exp_end) {
     const uint64_t* ptr;
     uint64_t n, acc, res;
@@ -266,7 +353,7 @@ uint64_t get_residue(uint64_t root, uint64_t prime) {
     return mpz_get_ui(g_a);
 }
 
-//Thread entry point
+//Thread entry point. Sieves primes, allcates exp vectors, calls the functions above
 archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
     uint64_t j, modulo, root, residue, entry_index, chunk_j, vsize, fprod;
     uint64_t *exp_start, *exp_end;
@@ -293,7 +380,7 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
         if(!vectors[j])
             continue;
 
-        vectors[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(int64_t));
+        vectors[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(uint64_t));
         vectors[j][0] = 3;              //Size
         vectors[j][1] = INIT_ALLOC;     //Capacity
 
@@ -366,7 +453,7 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
         residue = get_residue(root, modulo);
 
         if(residue == 0)
-            fprintf(stderr, "Non-generous prime found! Value = %lu\n", modulo);
+            fprintf(stderr, "Non-generous prime found! Value = %lu (%lu)\n", modulo, root);
 
         entries[entry_index].prime = modulo;
         entries[entry_index].root = root;
@@ -385,74 +472,22 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
     return entries;
 }
 
-void load_primes(uint64_t N_max) {
-    uint32_t pfile_size, max_read, pmax;
-    int mag;
-
-    //fprintf(stderr, "Loading primes\n"); fflush(stderr);
-    //Open primes.dat to get primes needed for sieve
-    FILE* pfile = fopen(primes_file, "rb");
-    if(pfile == NULL) {
-        fprintf(stderr, "Could not find \"%s\"\n", primes_file);
-        exit(1);
-    }
-
-    //First 4 bytes is total number of primes
-    if(fread(&pfile_size, sizeof(uint32_t), 1, pfile) != 1) {
-        fprintf(stderr, "Format error in \"%s\"\n", primes_file);
-        exit(1);
-    }
-    
-    //Allocate intial space for primes
-    primes = (uint32_t*) malloc(pfile_size * sizeof(uint32_t));
-
-    //Calculate pmax as a rough overestimate of sqrt(N_max)
-    if(!__builtin_clzll(N_max))
-        //Linear approximation of sqrt(x) near 4294967296
-        pmax = 0x80000000 + (N_max >> 33);
-    else {
-        //Find closet power of 2 to sqrt(N_max), then do one Newton iteration
-        mag = (64 - __builtin_clzll(N_max)) / 2;
-        pmax = ((uint32_t)1 << (mag - 1)) + (N_max >> (mag + 1));
-    }
-    pmax = (N_max / pmax + pmax) / 2;   //One final iteration
-
-    //Read pfile in 4KB blocks until primes are getting larger than pmax
-    max_read = 0;
-    while(max_read < pfile_size) {
-        max_read += fread(&primes[max_read], sizeof(uint32_t), 1024, pfile);
-        
-        //Break when final prime is greater or equal to sqrt(N_max)
-        if(primes[max_read - 1] >= pmax)
-            break;
-    }
-    fclose(pfile);
-
-    //Find the actual index of first prime larger than pmax
-    for(max_pfacs = max_read; max_pfacs >= max_read - 1024; --max_pfacs)
-        if(primes[max_pfacs - 2] <= pmax)
-            break;
-
-    //Truncate primes array to free up memory for next steps
-    primes = (uint32_t*) realloc(primes, max_pfacs * sizeof(uint32_t));
-    //fprintf(stderr, "%u\n", primes[max_pfacs - 1]);
-}
-
-//Main entry point. Reads in upper limit and chunk_size from argv, then splits
+//Main entry point. Reads in start, block_size and chunk_size from argv, then splits
 //the total range by chunk_size to be divided amongst parallel threads using OpenMP.
 int main(int argc, char **argv) {
     char* endstr_ptr;
-    uint64_t i, j, num_chunks, max_root, maxr_prime;
+    uint64_t sys_memory, i, j, num_chunks, max_root, maxr_prime;
 
     char fcsv[] = "%lu,%lu,%lu\n";
     char ftab[] = "Prime: %-19lu Root: %-4lu Residue: %lu\n";
     char* output = ftab;
 
+    //Parse arguments, if any
     if(argc < 4) {
         puts("64-Bit Non-Generous Prime Searcher by Dylan G.\n");
-        puts("Usage: ngp [c/b] start_value total_size chunk_size");
+        puts("Usage: ngp [c/b] start_value total_size chunk_size [> destination_file]");
         puts("    c: Format output as csv, base 10");
-        puts("    b: Format output as binary");
+        puts("    b: Format output as binary data");
         puts("    (default): tabular output, base 10");
         return 0;
         
@@ -471,28 +506,58 @@ int main(int argc, char **argv) {
     uint64_t start = strtoull(argv[argc - 3], &endstr_ptr, 10) / 2;
     uint64_t block_size = strtoull(argv[argc - 2], &endstr_ptr, 10) / 2;
     chunk_size = strtoull(argv[argc - 1], &endstr_ptr, 10) / 2;
-    uint64_t N_max = 2 * (start + block_size);
+
+    uint64_t N_min = 2 * start;
+    uint64_t N_max = N_min + 2 * block_size;
 
     //Check if largest value overflows past 2^64
-    if(N_max < start * 2) {
-        fprintf(stderr, "Error - range exceeds 2^64-1\n");
+    if(N_max < N_min) {
+        fprintf(stderr, "Error: maximum value exceeds 2^64-1\n");
         return 1;
     }
 
-    //Get system info for checking system memory
-    struct sysinfo info;
-    if (sysinfo(&info) != 0) {
-        perror("sysinfo");
+    //Check if chunk size is larger than total block size
+    if(chunk_size > block_size) {
+        fprintf(stderr, "Error: chunk size (%lu) must be smaller than total size (%lu)\n",
+                chunk_size * 2, block_size * 2);
         return 1;
     }
 
-    //Check RAM capacity against rough prediction of usage
-    if(chunk_size * INIT_ALLOC + 1e9 > info.totalram / omp_get_num_threads()) {
-        fprintf(stderr, "Error - insufficient system memory. Try a smaller chunk size.\n");
+    //Get RAM capacity in bytes using platform-specific system call
+    #ifdef __APPLE__
+        int mib[2] = {CTL_HW, HW_MEMSIZE};
+        size_t len_memory = sizeof(sys_memory);
+        
+        if (sysctl(mib, 2, &sys_memory, &len_memory, NULL, 0) == -1) {
+            perror("sysctl");
+            return 1;
+        }
+    #else
+        struct sysinfo info;
+        if (sysinfo(&info) != 0) {
+            perror("sysinfo");
+            return 1;
+        }
+        sys_memory = info.totalram;
+    #endif
+
+    //Estimate expected number of primes in block and in (first) chunk using PNT
+    uint64_t primes_in_block = noln(N_max) - noln(N_min);
+    uint64_t primes_in_chunk = noln(N_min + 2 * chunk_size) - noln(N_min);
+
+    //Estimate RAM usage. Shared: primes file & archive array. Thread: allocated vectors & ALL vector pointers.
+    uint64_t shared_mem = 814000000 + primes_in_block * sizeof(archive);
+    uint64_t thread_mem = primes_in_chunk * INIT_ALLOC * sizeof(uint64_t) + chunk_size * sizeof(size_t);
+    uint64_t req_memory = shared_mem + thread_mem * omp_get_num_threads();
+
+    //Check RAM capacity against prediction (assuming num_chunks isn't huge!)
+    fprintf(stderr, "Predicted RAM usage: %lu MiB (capacity: %lu MiB)\n", req_memory >> 20, sys_memory >> 20);
+    if(req_memory > sys_memory) {
+        fprintf(stderr, "Error: insufficient system memory\n");
         return 1;
     }
 
-    //Load in primes up through sqrt(block end) from primes.dat
+    //Load in primes up through sqrt(N_max) from primes.dat
     load_primes(N_max);
     
     //Calculate the total number of chunks to be split among threads and allocate output arrays
@@ -500,12 +565,13 @@ int main(int argc, char **argv) {
     archive** lists = (archive**) malloc(num_chunks * sizeof(archive*));
     uint32_t* counts = (uint32_t*) malloc(num_chunks * sizeof(uint32_t));
 
-    //Use OpenMP to split chunks among threads
-    #pragma omp parallel for
+    //Split chunks among threads using guided schedule since higher chunks contain fewer primes
+    #pragma omp parallel for schedule(guided)
     for(i = 0; i < num_chunks; ++i)
         lists[i] = find_mprs(start + i * chunk_size, &counts[i]);
+    fprintf(stderr, "Search complete, writing to output\n");
 
-    //Format output to stdout
+    //Format output to stdout while searching for the maximum root
     max_root = 0;
     for(i = 0; i < num_chunks; ++i) {
         if(!output)
