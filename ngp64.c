@@ -100,29 +100,54 @@ void load_primes(uint64_t N_max) {
     //fprintf(stderr, "%u\n", primes[max_pfacs - 1]);
 }
 
+#define PATTERN_SIZE 105
+
 //Performs a sieve of eratosthenes on the chunk by setting vector pointers to null
 void prime_sieve(const uint64_t chunk_start, uint64_t** vectors) {
     uint32_t i, p;
-    uint64_t j, p2, N_min, mstart;
+    uint64_t j, p2, mstart;
 
-    //First 2n+1 value for calculating offsets
-    N_min = 2 * chunk_start + 1;
+    const size_t const pattern105[] = {
+        0,1,1,0,1,0,0,0,1,0,0,1,0,1,0,
+        0,1,1,0,1,0,0,1,1,0,0,1,0,0,1,
+        0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,
+        0,1,1,0,0,0,0,1,1,0,0,0,0,1,1,
+        0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,
+        0,1,0,0,1,0,0,1,1,0,0,1,0,1,1,
+        0,0,1,0,1,0,0,1,0,0,0,1,0,1,1,
+    };
 
-    //Loop through each prime number except 2 (since 2n+1 is always odd)
-    for(i = 1; i < max_pfacs; ++i) {
+    uint64_t N_min_pos = (chunk_start + (PATTERN_SIZE + 1) / 2) % PATTERN_SIZE;
+
+    if(N_min_pos) {
+        memmove(&vectors[0], &pattern105[N_min_pos], (PATTERN_SIZE - N_min_pos) * sizeof(uint64_t*));
+        N_min_pos = PATTERN_SIZE - N_min_pos;
+    }
+
+    for(j = N_min_pos; j < chunk_size + 1 - PATTERN_SIZE; j += PATTERN_SIZE)
+        memmove(&vectors[j], pattern105, PATTERN_SIZE * sizeof(uint64_t*));
+
+    uint64_t N_max_pos = chunk_size - j;
+    if (N_max_pos)
+        memmove(&vectors[j], pattern105, N_max_pos * sizeof(uint64_t*));
+
+    //Loop through each prime number, starting at 11
+    for(i = 4; i < max_pfacs; ++i) {
         p = primes[i];
-        p2 = (uint64_t) p * p;
+        p2 = (uint64_t) p * p / 2;
 
         //Get the offset of p^2 if it's in our range of N values
         //(Multiples of p below p^2 are already eliminated)
-        if (p2 > N_min)
-            mstart = (p2 - N_min) / 2;
+        mstart = p2 - chunk_start;
 
         //Otherwise just get the offset of the first N divisible by p
-        else
-            mstart = p - 1 - ((N_min - p) / 2 - 1) % p;
+        if(p2 < chunk_start)
+            mstart = p - 1 - (-mstart - 1) % p;
+
+        if(mstart > chunk_size) break;
 
         //Set pointer to null in every position divisible by p
+        if(p == 1) __builtin_unreachable();
         for(j = mstart; j < chunk_size; j += p)
             if(vectors[j])
                 vectors[j] = 0;
@@ -130,24 +155,42 @@ void prime_sieve(const uint64_t chunk_start, uint64_t** vectors) {
 }
 
 //For each N, fills up vectors with (N-1)/p values, where p is each prime factor of N-1
-void gen_exps(const uint64_t chunk_start, uint64_t** vectors) {
+void gen_exp_vectors(const uint64_t chunk_start, uint64_t** vectors) {
     uint32_t i, p;
     uint64_t j, first_pos, N1_max, exp_val, newcap, divisor;
     uint128_t product;
 
+    //Max 2n (ie N-1) value in chunk
     N1_max = 2 * (chunk_start + chunk_size);
 
-    //Primary loop: Loop through prime factors (p = 2 was already accounted for)
+    //Allocate vectors for each prime number in order to store (N-1)/p exponents
+    for(j = 0; j < chunk_size; ++j) {
+        if(!vectors[j])
+            continue;
+
+        vectors[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(uint64_t));
+        vectors[j][0] = 3;              //Size
+        vectors[j][1] = INIT_ALLOC;     //Capacity
+
+        //First actual exponent value, which will correspond to the largest prime factor
+        //of N-1. It's calculated by multiplying all prime factors less than sqrt(N-1).
+        //Here we are using some bit trickery to take care of all powers of 2 right now
+        vectors[j][2] = 2 * ((chunk_start + j) & -(chunk_start + j));
+    }
+
+    //Primary loop: Loop through the odd prime factors
     for(i = 1; i < max_pfacs; i++) {
         p = primes[i];
 
         //Get the offset of the first value divisible by p.
         first_pos = p - chunk_start % p;
 
-        //First 2n/p (aka (N-1)/p) value, minus 2 to fit with for loop
-        exp_val = 2 * (chunk_start + first_pos) / p - 2;
+        //The 2n/p (aka (N-1)/p) value just BEFORE the chunk
+        //chunk_start / p has parentheses so that there is only one div instruction
+        exp_val = 2 * (chunk_start / p);
 
         //Loop through chunk and push back exp_val into each vector
+        if(p == 1) __builtin_unreachable();
         for(j = first_pos; j < chunk_size; j += p) {
             exp_val += 2;
             if(!vectors[j]) continue;
@@ -183,13 +226,15 @@ void gen_exps(const uint64_t chunk_start, uint64_t** vectors) {
                 break;
 
             //Tertiary loop: Update fprods (first element of each vector)
+            //do loop avoids an unnecessary conditional jump instruction
             j = first_pos;
             do {
                 if(vectors[j])
                     vectors[j][2] *= p;
 
-                //This sum cant overflow unless chunk_size is on the order of 10^19
+                //j + divisor can't overflow unless chunk_size is on the order of 10^19
                 //Proof: try ngp 18401610824589482000 1000 1000
+                if(divisor == 1) __builtin_unreachable();
                 j += divisor;
             } while(j < chunk_size);
 
@@ -200,47 +245,18 @@ void gen_exps(const uint64_t chunk_start, uint64_t** vectors) {
                 break;
 
             //Product is stored in a dedicated uint128 before casting to uint64
-            //to ensure that only one mul instruction is generated
+            // to ensure that only one mul instruction is generated
             divisor = (uint64_t) product;
         }
     }
 }
 
-//Calculates the modular inverse (base 2^64) of a
-uint64_t mod_inv64(uint64_t a) {
-    uint64_t r1, r2, s1, s2, quot, swap;
-
-    r2 = a;
-    s1 = 0;
-    s2 = 1;
-
-    //Used instead of 2^64, works the same!
-    quot = 0xFFFFFFFFFFFFFFFF / r2;
-    swap = -quot * r2;
-
-    //Do loop is used to avoid an unecessary cmp instruction
-    do {
-        //Extended Euclidean algorithm
-        r1 = r2;
-        r2 = swap;
-
-        swap = s1 - quot * s2;
-        s1 = s2;
-        s2 = swap;
-
-        quot = r1 / r2;
-        swap = r1 - quot * r2;
-    } while(swap);
-
-    return s2;
-}
-
 //Multiplication reduction subroutine for Montgomery modular multiplication
-uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t p_i) {
+uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t p_inv) {
     uint64_t result;
 
-    //Calculate p * (n * p_i % 2^64)
-    uint128_t q = (uint128_t) p * (uint64_t)(n * p_i);
+    //Calculate p * (n * p_inv % 2^64)
+    uint128_t q = (uint128_t) p * (uint64_t)(n * p_inv);
 
     //arm64-specific instructions for efficiently calculating ((q + n) >> 64) % p
     #if defined(__aarch64__)
@@ -265,7 +281,7 @@ uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t p_i) {
         uint128_t sum = q + n;
 
         //Need to save the state of the carry flag resulting from the sum above.
-        //The sbb instruction sets eax to 0 if C is not set, but -1 if C is set.
+        //The sbb instruction sets eax to 0 if CF is not set, but -1 if CF is set.
         //By storing this result in chk_carry, we can include this as a necessary
         //condition to subtract p from the total at the end.
         int32_t chk_carry;
@@ -292,20 +308,24 @@ uint64_t mm_reduce(uint128_t n, uint64_t p, uint64_t p_i) {
 //Finds the smallest positive primitive root of prime modulo using list of trial exponents.
 uint64_t get_min_pr(const uint64_t p, const uint64_t* const exp_start, const uint64_t* const exp_end) {
     const uint64_t* ptr;
-    uint64_t n, acc, res;
+    uint64_t n, acc, res, root, root_mm;
 
-    uint64_t pi = mod_inv64(-p);
-    uint64_t r2 = 1 + (uint64_t)((uint128_t) -1 % p);
-    uint64_t rootp;
+    //2^64 % p
+    uint64_t modp = 1 + (uint64_t)((uint128_t) -1 % p);
+
+    //Calculate the inverse (modulo 2^64) of negative p
+    uint64_t p_inv = (3 * -p) ^ 2;
+    for(int i = 0; i < 4; ++i)
+        p_inv *= (2 + p * p_inv);
 
     //Loop through root candidates, starting at 2
-    uint64_t root = 1;
+    root = 1;
     while(1) {
         //Incrementing at the start of the loop reduces the number of jump instructions
         ++root;
 
         //Convert root in preparation for Montgomery modular multiplication
-        rootp = mm_reduce((uint128_t) root * r2, p, pi);
+        root_mm = mm_reduce((uint128_t) root * modp, p, p_inv);
 
         //Loop through trial exponents. Back to front is more efficient as it breaks sooner
         ptr = exp_start;
@@ -315,15 +335,15 @@ uint64_t get_min_pr(const uint64_t p, const uint64_t* const exp_start, const uin
             // Perform modular exponentiation by squaring, with
             //  128-bit intermediate values (faster than GMP)
             res = 1;
-            acc = rootp;
+            acc = root_mm;
             while(1) {
                 if(n & 1)
-                    res = mm_reduce((uint128_t) acc * res, p, pi);
+                    res = mm_reduce((uint128_t) acc * res, p, p_inv);
 
                 n >>= 1;
                 if (n == 0) break;
 
-                acc = mm_reduce((uint128_t) acc * acc, p, pi);
+                acc = mm_reduce((uint128_t) acc * acc, p, p_inv);
             }
 
             //Move on to next root candidate if result is ever 1
@@ -359,10 +379,8 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
     uint64_t *exp_start, *exp_end;
 
     uint64_t** vectors = (uint64_t**) malloc(chunk_size * sizeof(uint64_t*));
-    for(j = 0; j < chunk_size; ++j)
-        vectors[j] = (uint64_t*) 1;
 
-    //Sieve out numbers where 2n+1 is composite
+    //Sieve out numbers (make pointer null) wherever 2n+1 is composite
     //fprintf(stderr, "Sieving primes\n"); fflush(stderr);
     prime_sieve(chunk_start, vectors);
 
@@ -375,24 +393,9 @@ archive* find_mprs(const uint64_t chunk_start, uint32_t* count_pointer) {
     //Allocate memory for list of entries before creating exponent vectors
     archive* entries = (archive*) malloc(count * sizeof(archive));
 
-    //Allocate vectors for each prime number in order to store (N-1)/p exponents
-    for(j = 0; j < chunk_size; ++j) {
-        if(!vectors[j])
-            continue;
-
-        vectors[j] = (uint64_t*) malloc(INIT_ALLOC * sizeof(uint64_t));
-        vectors[j][0] = 3;              //Size
-        vectors[j][1] = INIT_ALLOC;     //Capacity
-
-        //First actual exponent value, which will correspond to the largest prime factor
-        //of N-1. It's calculated by multiplying all prime factors less than sqrt(N-1).
-        //Here we are using some bit trickery to take care of all powers of 2 right now
-        vectors[j][2] = 2 * ((chunk_start + j) & -(chunk_start + j));
-    }
-
     //Fill vectors with (N-1)/p values for each prime number N
     //fprintf(stderr, "Factoring\n"); fflush(stderr);
-    gen_exps(chunk_start, vectors);
+    gen_exp_vectors(chunk_start, vectors);
 
     //Initialize 256-bit integer structs
     mpz_init(g_a);
