@@ -1,0 +1,56 @@
+#!/bin/bash
+ngpid=$(pgrep -f "ngp-loop.sh ")
+
+if [ "$ngpid" != "" ]; then
+	if [ "$1" == "stop" ]; then
+		kill $ngpid
+		kill $(pgrep ngp-bin)
+		echo "NGP program stopped"
+		exit
+	fi
+
+	echo "Already running [$ngpid]"
+	exit
+fi
+
+make
+if [ ! -f primes.dat ]; then
+    echo "primes.dat not found, running sieve:"
+    ./psieve
+fi
+
+if [ "$#" -ne "7" ]; then
+    read -p "Starting value      : " var[0]
+    read -p "Stopping value      : " var[1]
+    read -p "Thread Chunk Size   : " var[2]
+    read -p "# Residue classes   : " var[3]
+    read -p "Write to file every : " var[4]
+    read -p "Output directory    : " outdir
+    read -p "Log file path       : " logfile
+else
+    var[0]=$1
+    var[1]=$2
+    var[2]=$3
+    var[3]=$4
+    var[4]=$5
+    outdir=$6
+    logfile=$7
+fi
+
+for i in {0..4}; do
+    var_sep[i]=$(python3 -c "print(f\"{int(${var[i]}):,d}\")")
+    var[i]=$(python3 -c "print(int(${var[i]}))")
+done
+
+echo
+echo "-----------NEW BATCH------------"
+echo "Starting value      : ${var_sep[0]}"
+echo "Stopping value      : ${var_sep[1]}"
+echo "Thread Chunk Size   : ${var_sep[2]}"
+echo "# Residue classes   : ${var_sep[3]}"
+echo "Write to file every : ${var_sep[4]}"
+echo "Output directory    : $outdir"
+echo "Log file path       : $logfile"
+
+chmod +x "ngp-loop.sh"
+nohup "./ngp-loop.sh" ${var[0]} ${var[1]} ${var[2]} ${var[3]} ${var[4]} $outdir $logfile >> /dev/null 2>&1 &
