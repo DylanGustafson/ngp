@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>         //only needed for memmove
+#include <string.h>         //only needed for memcpy
 #include <gmp.h>            //GNU multiprecision arithmetic
 #include <omp.h>            //OpenMP
 
@@ -18,17 +18,8 @@
 
 typedef unsigned __int128 uint128_t;
 
-typedef struct{
-    uint64_t x0;
-    uint64_t x1;
-    uint64_t x2;
-    uint64_t x3;
-} uint256_t;
-
-//IO file names
-const char* primes_file = "primes.dat";
-
 //Global vars that remain constant across each thread
+const char* primes_file = "primes.dat";
 uint64_t chunk_size;
 uint64_t n_classes;
 uint32_t max_pfacs;
@@ -236,9 +227,11 @@ void gen_exp_vectors(const uint64_t chunk_start, uint64_t** vectors) {
                 if(vectors[j])
                     vectors[j][2] *= p;
 
-                //j + divisor can't overflow unless chunk_size is on the order of 10^19
-                //Proof: try ngp 18401610824589482000 1000 1000
+                //Saves space to help avoid cache misses
                 if(divisor == 1) __builtin_unreachable();
+
+                //j + divisor can't overflow unless chunk_size is on the order of 10^19
+                //Example: try ./ngp 18401610824589482000 1000 1000 10
                 j += divisor;
             } while(j < chunk_size);
 
@@ -288,7 +281,7 @@ uint64_t mm_reduce(uint64_t a, uint64_t b, uint64_t p, uint64_t p_inv) {
         asm volatile goto (
             "add     %[ql], %[nl]\n\t"          //128-bit addition of q and n, which
             "adc     %[qh], %[nh]\n\t"          // affects the carry flag if it overflows
-            "mov     %[res], %[qh]\n\t"         //Store (q+n)>>64 into result var
+            "mov     %[res], %[qh]\n\t"         //Store (q+n)>>64 into result var (%rax)
             "jc      %l[overflow]\n\t"          //If sum overflowed, jump to label
             "cmp     %[res], %[p]\n\t"          //Also need to jump there if
             "jnb     %l[overflow]"              // result is not below p
