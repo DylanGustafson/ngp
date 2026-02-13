@@ -57,7 +57,6 @@ u32 int_sqrt(u64 n) {
 // Reads in primes below 2^32 from primes.dat
 void load_primes(u64 N_max) {
     u32 pfile_size, max_read, pmax;
-    int mag;
 
     // fprintf(stderr, "Loading primes\n"); fflush(stderr);
     // Open primes.dat to get primes needed for sieve
@@ -270,11 +269,9 @@ u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
         asm volatile(
             "adds     x5, %[ml], %[tl]\n\t"     // 128-bit addition of m and t, which stores
             "adcs     x6, %[mh], %[th]\n\t"     // (m+t)>>64 into x6 and affects carry flag
-
             "sub      x5, x6, %[N]\n\t"         // Save ((m+t)>>64) - N into x5 in case it's needed
             "ccmp     x6, %[N], 2, cc\n\t"      // If m+t didnt carry, check if x6 > N, otherwise set carry
             "csel     %[res], x5, x6, hi"       // If x6 > N or carry flag had been cleared, subtract N
-
             : [res] "=r" (result)
             : [ml] "r" ((u64) m),
               [mh] "r" ((u64) (m >> 64)),
@@ -291,13 +288,10 @@ u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
         asm volatile goto (
             "add     %[ml], %[tl]\n\t"          //  128-bit addition of m and t, which
             "adc     %[mh], %[th]\n\t"          // affects the carry flag if it overflows
-
             "mov     %[res], %[mh]\n\t"         // Store (m+t)>>64 into result var (%rax)
             "jc      %l[over]\n\t"              // If sum overflowed, jump to label
-
             "cmp     %[res], %[N]\n\t"          // Also need to jump there if
             "jnb     %l[over]"                  //  result is not below p
-
             : [res] "=r" (result)
             : [ml] "r" ((u64) m),
               [mh] "r" ((u64) (m >> 64)),
@@ -459,12 +453,13 @@ void find_mprs(const u64 chunk_start) {
         mpz_divexact_ui(*m1, *m1, N);
         q = mpz_get_ui(*m1);
 
+        //  Print numbers of interest to stderr
         if (__builtin_expect(q == 0, 0))
             fprintf(stderr, "Non-generous prime found! Value = %lu (%lu)\n", N, root);
         else if (__builtin_expect(q == 1, 0))
             fprintf(stderr, "q = 1. Value = %lu (%lu)\n", N, root);
 
-        //res_counts_thr[(u64)((double)q / N * BIN_COUNT)] += 1;
+        // Increment counter in q/N bin
         res_counts_thr[(u128)q * BIN_COUNT / N] += 1;
         free(vectors[j]);
     }
