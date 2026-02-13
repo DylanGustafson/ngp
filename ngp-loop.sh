@@ -3,15 +3,18 @@
 start=$1
 stop=$2
 chunk=$3
-class=$4
-block=$5
-outdir=$6
-logfile=$7
+block=$4
+outdir=$5
+logfile=$6
+
+if [ ! -d $outdir ]; then
+    mkdir $outdir
+fi
 
 touch $logfile
 echo >> $logfile
 echo $(date "+%F %T") >> $logfile
-echo "Running from $start to $stop, with $class classes. Thread chunk size: $chunk. Writing every $block." >> $logfile
+echo "Running from $start to $stop, with 1000 q/N bins. Thread chunk size: $chunk. Writing every $block." >> $logfile
 
 tic=$(date +%s)
 
@@ -31,7 +34,7 @@ for ((i=$start; i<$stop; i+=$block)); do
     fi
 
     outfile="$outdir/$from-to-$to.csv"
-    ./ngp-bin c $i $block $chunk $class > $outfile 2>> $logfile
+    ./ngp-bin c $i $block $chunk > $outfile 2>> $logfile
 
 done
 
