@@ -1,5 +1,6 @@
 from sympy.ntheory.residue_ntheory import is_primitive_root
 from sympy.ntheory import isprime, primefactors
+from subprocess import run
 import sys
 
 def build_line(N):
@@ -16,30 +17,45 @@ def build_line(N):
 
     return f"{N} ({root} {q}) " + " ".join([str(i) for i in pfacs])
 
-arg = sys.argv[-1]
-try:
-    N = int(arg)
-    print(build_line(N))
+if len(sys.argv) == 1:
+    fname = sys.argv[0]
+    print("Usage:")
+    print(f"  Check a single number        : python3 {fname} number")
+    print(f"  Check a stderr output file   : python3 {fname} file_name")
+    print(f"  Run ngp-bin and check output : python3 {fname} start_value total_size")
+    print("\nLine format: number (root q_value) pfac1 pfac2 ...")
     exit()
 
-except ValueError:
-    pass
+elif len(sys.argv) > 2:
+    cmd = ['./ngp-bin', sys.argv[1], sys.argv[2], sys.argv[2]]
+    print("Running:", " ".join(cmd))
+    output = run(cmd, capture_output=True, text=True).stderr
+    print("Done!", end=" ")
 
-with open(arg, 'r') as f:
-    lines = f.read().splitlines()
+elif sys.argv[-1].isdecimal():
+    N = int(sys.argv[-1])
+    print("True output:", build_line(N))
+    exit()
 
+else:
+    with open(sys.argv[-1], 'r') as f:
+        output = f.read()
+
+print("Checking...")
+lines = output.splitlines()
 line_count = len(lines)
-for i, line in enumerate(lines):
+for i, out_line in enumerate(lines):
     print(f"{i + 1}/{line_count}", end="\r")
-    Nstr = line.split(" ", 1)[0]
+
+    Nstr = out_line.split(" ", 1)[0]
     if not Nstr.isdecimal():
         continue
 
     true_line = build_line(int(Nstr))
-    if true_line != line:
+    if true_line != out_line:
         print("Value Discrepency!")
-        print("Given: " + line)
-        print("True : " + true_line)
+        print(" Output: " + out_line)
+        print(" True  : " + true_line)
         exit()
 
 print("\nPassed!")
