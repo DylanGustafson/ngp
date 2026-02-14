@@ -2,23 +2,22 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>         // only needed for memcpy
-#include <gmp.h>            // GNU multiprecision arithmetic
-#include <omp.h>            // OpenMP
+#include <string.h>        // only needed for memcpy
+#include <gmp.h>           // GNU multiprecision arithmetic
+#include <omp.h>           // OpenMP
 
 #ifdef __APPLE__
-  #include <sys/sysctl.h>   // MacOS-specific
+  #include <sys/sysctl.h>  // MacOS-specific
 #else
-  #include <sys/sysinfo.h>  // Linux-specific
+  #include <sys/sysinfo.h> // Linux-specific
 #endif
 
-#define BIN_COUNT 1000
+#define BIN_COUNT 1000     // Number of bins used for q/N histogram
+#define INIT_ALLOC 8       // Initial vector allocation: 6 prime factors (1 stdev above mean)
+#define MID_ALLOC 12       // Mid allocation: 10 prime factors (3 stdev's above mean)
+#define MAX_ALLOC 17       // Maximum possible (15) distinct prime factors for 64-bit int (eg: 693386350578511591)
 
-#define INIT_ALLOC 8  // Initial vector allocation: 6 prime factors (1 stdev above mean)
-#define MID_ALLOC 12  // Mid allocation: 10 prime factors (3 stdev's above mean)
-#define MAX_ALLOC 17  // Maximum possible (15) distinct prime factors for 64-bit value (ex: 693386350578511591)
-
-typedef unsigned __int128 u128;
+typedef __uint128_t u128;
 typedef uint64_t u64;
 typedef uint32_t u32;
 
@@ -30,6 +29,46 @@ u32* primes;
 mpz_t* mpz_vars;
 u64* residue_counts;
 u64** vector_ptrs;
+
+// Converts numeric string to u64 type, while also handling integer scientific notation
+u64 str_to_u64(char* str) {
+    int i, overflow;
+    u64 num = 0;
+    const char err_msg[] = "Error: input larger than 2^64-1: %s\n";
+
+    // Loop through digits until reaching 'e', 'E', or null char, or until overflow
+    while ((str[i] | 0x20) != 'e') {
+        if (str[i] == 0)
+            return num;
+
+        overflow = __builtin_mul_overflow(num, 10, &num);
+        overflow |= __builtin_add_overflow(num, str[i] - '0', &num);
+        if (overflow) {
+            fprintf(stderr, err_msg, str);
+            exit(1);
+        }
+        ++i;
+    }
+
+    // Read in 1 or 2 digit exponent
+    int exp = str[i + 1] - '0';
+    if (str[i + 2])
+        exp = exp * 10 + str[i + 2] - '0';
+
+    // Assume "e9" means "1e9"
+    if (num == 0)
+        num = 1;
+
+    // Multiply by 10^exp and return
+    for(i = 0; i < exp; ++i) {
+        overflow = __builtin_mul_overflow(num, 10, &num);
+        if (overflow) {
+            fprintf(stderr, err_msg, str);
+            exit(1);
+        }
+    }
+    return num;
+}
 
 // Calculates a rough overestimate of n/ln(n)
 u64 noln(u64 n) {
@@ -436,13 +475,14 @@ void find_mprs(const u64 chunk_start) {
         // Find first primitive root of N
         N = 2 * chunk_j + 1;
         root = get_min_pr(N, exp_start, exp_end);
-        //fprintf(stderr, "%13lu: %lu\n", N, root);
 
-        /*// Debug: Print out exponent list for each N
-        fprintf(stderr, "%lu:", N);
-        for (int i = 0; i < exp_end - exp_start; ++i)
-             fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
-        fprintf(stderr, "\n");*/
+        // Verbose output: Print N, root, and prime factors of N-1 to stderr
+        #ifdef verbose
+            fprintf(stderr, "%lu (%lu):", N, root);
+            for (int i = 0; i < exp_end - exp_start; ++i)
+                fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
+            fprintf(stderr, "\n");
+        #endif
 
         // Calculate q = (root ^ N % N^2 - root) / N
         mpz_set_ui(*m1, root);
@@ -468,8 +508,8 @@ void find_mprs(const u64 chunk_start) {
 // Main entry point. Reads in start, block_size and chunk_size from argv, then splits
 // the total range by chunk_size to be divided amongst parallel threads using OpenMP.
 int main(int argc, char **argv) {
-    char* endstr_ptr;
     u64 sys_memory, i, j;
+    int add_2357 = 0;
 
     // Parse arguments, if any
     if (argc < 4) {
@@ -481,9 +521,9 @@ int main(int argc, char **argv) {
     }
 
     // Read in numerical inputs
-    u64 block_start = strtoull(argv[argc - 3], &endstr_ptr, 10) / 2;
-    u64 block_size = strtoull(argv[argc - 2], &endstr_ptr, 10) / 2;
-    chunk_size = strtoull(argv[argc - 1], &endstr_ptr, 10) / 2;
+    u64 block_start = str_to_u64(argv[argc - 3]) / 2;
+    u64 block_size = str_to_u64(argv[argc - 2]) / 2;
+    chunk_size = str_to_u64(argv[argc - 1]) / 2;
 
     u64 N_min = 2 * block_start;
     u64 N_max = N_min + 2 * block_size;
@@ -496,12 +536,32 @@ int main(int argc, char **argv) {
 
     // Check if chunk size is larger than total block size
     if (chunk_size > block_size) {
-        fprintf(stderr, "Error: chunk size (%lu) must be smaller than total size (%lu)\n",
-                chunk_size * 2, block_size * 2);
+        fprintf(stderr, "Error: chunk size (%lu) must be smaller than total size (%lu)\n", chunk_size * 2, block_size * 2);
         return 1;
     }
 
-    int max_threads = omp_get_max_threads();
+    // Handle starting values below 10
+    if (block_start < 5) {
+        block_start = 5;
+        block_size -= 5;
+        add_2357 = 1;
+
+        // For 1 billion, split into 10001 chunks
+        if (block_size == 499999995)
+            chunk_size = 49995;
+
+        //For 10 million or less, just use a single thread
+        else if (block_size < 5000000)
+            chunk_size = block_size;
+
+        // Otherwise exit
+        else {
+            fprintf(stderr, "start_value must be at least 10, OR use total_size of 1e9 or <1e7\n");
+            return 1;
+        }
+
+        fprintf(stderr, "Changed args to %lu %lu %lu\n", block_start * 2, block_size * 2, chunk_size * 2);
+    }
 
     // Get RAM capacity in bytes using platform-specific system call
     #ifdef __APPLE__
@@ -522,6 +582,7 @@ int main(int argc, char **argv) {
     #endif
 
     // Estimate RAM usage using PNT. Shared: prime factors array. Thread: allocated vectors & ALL vector pointers.
+    int max_threads = omp_get_max_threads();
     u64 primes_in_chunk = noln(N_min + 2 * chunk_size) - noln(N_min);
     u64 thread_mem = primes_in_chunk * MAX_ALLOC * sizeof(u64) + chunk_size * sizeof(size_t) + BIN_COUNT * sizeof(u64);
     u64 pfac_memory = noln(int_sqrt(N_max)) * sizeof(u32);
@@ -550,6 +611,14 @@ int main(int argc, char **argv) {
     #pragma omp parallel for schedule(guided)
     for (i = 0; i < block_size / chunk_size; ++i)
         find_mprs(block_start + i * chunk_size);
+
+    // If 0 - 10 was skipped, add in hard-coded q/N values for 2, 3, 5, and 7
+    if (add_2357) {
+        residue_counts[0]++;
+        residue_counts[2 * BIN_COUNT / 3]++;
+        residue_counts[1 * BIN_COUNT / 5]++;
+        residue_counts[4 * BIN_COUNT / 7]++;
+    }
 
     // Add up totals from each thread and format to stdout
     for (j = 0; j < BIN_COUNT; ++j) {

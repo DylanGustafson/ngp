@@ -16,3 +16,8 @@ ngp:
 	rm -f ngp-bin psieve
 	$(CC) -o psieve -O3 -march=native psieve32.c
 	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) ngp64.c $(LINKGMP)
+
+verbose:
+	rm -f ngp-bin psieve
+	$(CC) -o psieve -O3 -march=native psieve32.c
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose ngp64.c $(LINKGMP)
