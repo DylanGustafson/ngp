@@ -213,11 +213,11 @@ void gen_exp_vectors(const u64 chunk_start, u64** vectors) {
         vectors[j][0] = 3;           // Size
         vectors[j][1] = INIT_ALLOC;  // Capacity
 
-        // First "actual" exponent value, which will correspond to the largest
-        // prime factor of N-1. It's calculated by multiplying all prime factors
-        // (with multiplicity) less than sqrt(N-1). This initialization expression
-        // uses bit manipulation to handle p=2 by calculating the largest 2^e factor
-        vectors[j][2] = 2 * ((chunk_start + j) & -(chunk_start + j));
+        // First "actual" exponent value, which will correspond to the largest prime
+        // factor of N-1. It's calculated by multiplying all prime factors (with
+        // multiplicity) less than sqrt(N-1). This initialization expression uses
+        // bit manipulation to handle p=2 by calculating the largest 2^(e-1) factor
+        vectors[j][2] = (chunk_start + j) & -(chunk_start + j);
 
     } while (++j != chunk_size);
 
@@ -408,7 +408,7 @@ u64 get_min_pr(const u64 N, const u64* const exp_start, const u64* const exp_end
 
 // Thread entry point. Sieves primes, allcates exp vectors, calls the functions above
 void find_mprs(const u64 chunk_start) {
-    u64 j, N, root, chunk_j, vsize, fprod, q;
+    u64 j, N, root, half_N, vsize, fprod, q, index;
     u64 *exp_start, *exp_end;
 
     // Get pointers to thread-specific write locations
@@ -431,30 +431,25 @@ void find_mprs(const u64 chunk_start) {
     for (j = 0; j < chunk_size; ++j) {
         if (!vectors[j]) continue;
 
-        // Calculate n, aka (N-1)/2
-        chunk_j = chunk_start + j;
+        // Calculate (N-1)/2
+        half_N = chunk_start + j;
 
         // Get start and end pointers for exponents (the first two values are size and capacity)
         vsize = vectors[j][0];
         exp_start = vectors[j] + 2;
         exp_end = vectors[j] + vsize;
 
-        // The first actual value in each vector ("fprod") is the product of all prime factors of N-1
-        // (with exponents) below sqrt(N-1). If all prime factors of N-1 are less than sqrt(N-1), this
-        // result in just N-1, so we dont need it. Since we do need (N-1)/2, we can write it there.
-        if (*exp_start == chunk_j * 2) {
-            *exp_start = chunk_j;
-        }
-
+        // The first actual value in each vector ("fprod") is HALF the product of all prime factors
+        // of N-1 (with multiplicity) below sqrt(N-1). If all prime factors of N-1 are less than
+        // sqrt(N-1), this result is (N-1)/2, so we can just use it as the first exponent (p=2).
         // If N-1 DOES have a prime factor larger than sqrt(N-1) (more likely), the result is now
-        // (N-1)/p, where p is this largest prime factor. It's then ready to use as an exponent,
-        // however we need to move it to the end and replace the first value with (N-1)/2, as it's
-        // faster to check the exponents created from from smaller prime factors first.
-        else {
-            fprod = *exp_start;
+        // (N-1)/(p*2), where p is this largest prime factor. We need to double this value and move
+        // it to the end of the vector, and replace the first value with (N-1)/2, as it's faster to
+        // check the exponents created from from smaller prime factors first.
+        if (*exp_start != half_N) {
+            fprod = *exp_start * 2;
 
-            // If there is more capacity in the vector, simply move fprod to the
-            // end, put (N-1)/2 in its original position, and increment the end pointer
+            // If the vector has capacity, move fprod to the end and increment the end pointer
             if (vectors[j][1] > vsize) {
                 *exp_end = fprod;
                 exp_end += 1;
@@ -469,20 +464,12 @@ void find_mprs(const u64 chunk_start) {
                 exp_start -= 1;
             }
 
-            *exp_start = chunk_j;
+            *exp_start = half_N;
         }
 
         // Find first primitive root of N
-        N = 2 * chunk_j + 1;
+        N = 2 * half_N + 1;
         root = get_min_pr(N, exp_start, exp_end);
-
-        // Verbose output: Print N, root, and prime factors of N-1 to stderr
-        #ifdef verbose
-            fprintf(stderr, "%lu (%lu):", N, root);
-            for (int i = 0; i < exp_end - exp_start; ++i)
-                fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
-            fprintf(stderr, "\n");
-        #endif
 
         // Calculate q = (root ^ N % N^2 - root) / N
         mpz_set_ui(*m1, root);
@@ -498,6 +485,14 @@ void find_mprs(const u64 chunk_start) {
             fprintf(stderr, "Non-generous prime found! Value = %lu (%lu)\n", N, root);
         else if (__builtin_expect(q == 1, 0))
             fprintf(stderr, "q = 1. Value = %lu (%lu)\n", N, root);
+
+        // Verbose output: Print N, root, q, and prime factors of N-1 to stderr
+        #ifdef verbose
+        fprintf(stderr, "%lu (%lu %lu)", N, root, q);
+        for (int i = 0; i < exp_end - exp_start; ++i)
+            fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
+        fprintf(stderr, "\n");
+        #endif
 
         // Increment counter in q/N bin
         res_counts_thr[(u128)q * BIN_COUNT / N] += 1;
