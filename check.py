@@ -27,7 +27,8 @@ if len(sys.argv) == 1:
     exit()
 
 elif len(sys.argv) > 2:
-    cmd = ['./ngp-bin', sys.argv[1], sys.argv[2], sys.argv[2]]
+    run(["make", "verbose"])
+    cmd = ["./ngp-bin"] + sys.argv[1:]
     print("Running:", " ".join(cmd))
     output = run(cmd, capture_output=True, text=True).stderr
     print("Done!", end=" ")
@@ -53,9 +54,8 @@ for i, out_line in enumerate(lines):
 
     true_line = build_line(int(Nstr))
     if true_line != out_line:
-        print("Value Discrepency!")
+        print("\nValue Discrepency!")
         print(" Output: " + out_line)
         print(" True  : " + true_line)
-        exit()
 
 print("\nPassed!")
