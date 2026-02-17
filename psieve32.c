@@ -3,103 +3,161 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#define BLOCK_SIZE 0x8000
+#include <string.h>
+#include <omp.h>
 
+//32768 * 15. Splits 0x8000 to 0x80000000 sieve into 4369 chunks
+#define CHUNK_SIZE 491520
+
+typedef uint32_t u32;
+
+// All primes below 2^8
+const u32 primes8[] = {
+      2,  3,  5,  7, 11, 13, 17, 19, 23,
+     29, 31, 37, 41, 43, 47, 53, 59, 61,
+     67, 71, 73, 79, 83, 89, 97,101,103,
+    107,109,113,127,131,137,139,149,151,
+    157,163,167,173,179,181,191,193,197,
+    199,211,223,227,229,233,239,241,251
+};
+
+// Pattern for 3, 5, and 7
+const char pattern[] = {
+    0,1,1,0,1,0,0,0,1,0,0,1,0,1,0,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,0,1,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,
+    0,1,1,0,0,0,0,1,1,0,0,0,0,1,1,
+    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,
+    0,1,0,0,1,0,0,1,1,0,0,1,0,1,1,
+    0,0,1,0,1,0,0,1,0,0,0,1,0,1,1
+};
+
+const u32 p8count = sizeof(primes8)/sizeof(u32);
+const u32 pattern_size = sizeof(pattern);
 const char* output_name = "primes.dat";
+char* keep;
 
-//All (odd) primes below 2^8
-uint32_t static_primes[] = {  3,  5,  7, 11, 13, 17, 19, 23,
-                         29, 31, 37, 41, 43, 47, 53, 59, 61,
-                         67, 71, 73, 79, 83, 89, 97,101,103,
-                        107,109,113,127,131,137,139,149,151,
-                        157,163,167,173,179,181,191,193,197,
-                        199,211,223,227,229,233,239,241,251};
-
-//Perform a Sieve of Eratosthenes using primes below 2^m to get primes below 2^(2m)
-uint32_t rule_out(const uint32_t* pfacs, const uint32_t n, char* skip, const uint32_t max)
+// Performs a Sieve of Eratosthenes on a chunk of keep[] array using pfacs
+// Returns the total prime count in chunk
+uint32_t rule_out(const u32* pfacs, const u32 npfacs, const u32 chunk_start, const u32 chunk_stop)
 {
-    uint32_t i, j, p, count;
+    u32 i, j, p, mstart, count;
 
-    //Loop through given primes for sieve
-    for(i = 0; i < n; i++)
-    {
-        p = pfacs[i];
-
-        //Start from p^2 and flag all subsequent mutiples of p
-        for(j = (p * p - 1) / 2; j < max; j += p)
-            skip[j] = 1;
+    // Copy in the tail end of the pattern up to the first multiple of 105
+    u32 copy_start = (chunk_start + (pattern_size + 1) / 2) % pattern_size;
+    if (__builtin_expect(copy_start != 0, 1)) {
+        memcpy(&keep[chunk_start], &pattern[copy_start], pattern_size - copy_start);
+        copy_start = pattern_size - copy_start;
     }
 
-    //Count up primes in list
+    // Copy in the full pattern until it can't fit
+    for (j = chunk_start + copy_start; j + pattern_size <= chunk_stop; j += pattern_size)
+        memcpy(&keep[j], pattern, pattern_size);
+
+    // Copy in the beginning of the pattern up into the last bit of the chunk
+    u32 tail_size = chunk_stop - j;
+    if (__builtin_expect(tail_size != 0, 1))
+        memcpy(&keep[j], pattern, tail_size);
+
+    // Loop through given primes for sieve
+    for(i = 4; i < npfacs; i++) {
+        p = pfacs[i];
+        mstart = p * p / 2;
+
+        // Otherwise just get the offset of the first N divisible by p
+        if (mstart < chunk_start)
+            mstart = chunk_start + p - 1 - (chunk_start - mstart - 1) % p;
+
+        // Avoid unnecessary compiler optimization branch
+        if (p == 1) __builtin_unreachable();
+
+        // Zero every position divisible by p
+        for (j = mstart; j < chunk_stop; j += p)
+            if (keep[j])
+                keep[j] = 0;
+    }
+
+    // Count up primes in list
     count = 0;
-    for(j = 0; j < max; j++)
-        if(!skip[j])
-            count++;
+    for (j = chunk_start; j < chunk_stop; ++j)
+        if (keep[j])
+            ++count;
 
     return count;
 }
 
 int main(int argc, char* argv[])
 {
-    uint32_t pblock[BLOCK_SIZE];
-    uint32_t count, j, p;
+    u32 count, j, p;
 
     FILE* outfile = fopen(output_name, "wb");
-    if(outfile == NULL)
-    {
+    if(outfile == NULL) {
         printf("Could not create output file %s\n", output_name);
         return 1;
     }
 
-    char* skip = (char*) calloc(0x80000000, sizeof(char));
-    skip[0] = 1;
+    keep = (char*) aligned_alloc(64, 0x80000000);
 
-    //Use primes below 2^8 to get all primes below 2^16
-    uint32_t total_16 = rule_out(static_primes, sizeof(static_primes)/sizeof(uint32_t), skip, 0x8000);
+    // Use primes below 2^8 to get all primes below 2^16
+    u32 p16count = p8count + rule_out(primes8, p8count, 0x80, 0x8000);
 
-    //Create and fill array of primes below 2^16
-    uint32_t* dynamic_primes = (uint32_t*) malloc(total_16 * sizeof(uint32_t));
-    count = 0;
-    for(j = 0; j < 0x8000; j++)
-    {
-        if(skip[j]) continue;
+    // Create and fill array of primes below 2^16
+    u32* primes16 = (u32*) malloc(p16count * sizeof(u32));
+    memcpy(primes16, primes8, sizeof(primes8));
 
-        dynamic_primes[count] = 2 * j + 1;
-        count++;
+    count = p8count;
+    for (j = 0x80; j < 0x8000; ++j) {
+        if(!keep[j]) continue;
+
+        primes16[count] = 2 * j + 1;
+        ++count;
     }
 
-    //Use primes below 2^16 to get all primes below 2^32
+    // Use primes below 2^16 to get all primes below 2^32
     puts("Starting 32-bit sieve"); fflush(stdout);
-    uint32_t total_32 = rule_out(dynamic_primes, total_16, skip, 0x80000000);
-    free(dynamic_primes);
+
+    u32 num_chunks = (0x80000000 - 0x8000) / CHUNK_SIZE;
+    u32* chunk_totals = (u32*) malloc(num_chunks * sizeof(u32));
+    u32** primes32 = (u32**) malloc(num_chunks * sizeof(u32*));
+
+    #pragma omp parallel for
+    for (u32 i = 0; i < num_chunks; ++i) {
+        u32 start = 0x8000 + CHUNK_SIZE * i;
+        u32 stop = start + CHUNK_SIZE;
+
+        chunk_totals[i] = rule_out(primes16, p16count, start, stop);
+        primes32[i] = (u32*) malloc(chunk_totals[i] * sizeof(u32));
+
+        u32 p32count = 0;
+        for (u32 k = start; k < stop; ++k) {
+            if (!keep[k]) continue;
+
+            primes32[i][p32count] = 2 * k + 1;
+            ++p32count;
+        }
+    }
+
     puts("Finished 32-bit sieve, writing to file"); fflush(stdout);
 
-    //Increment to account for p=2, then write total count to start of file
-    total_32++;
-    fwrite(&total_32, sizeof(uint32_t), 1, outfile);
+    // Get grand total for 32-bit primes
+    u32 p32count = p16count;
+    for (j = 0; j < num_chunks; ++j)
+        p32count += chunk_totals[j];
 
-    //Hard code p=2. Not strictly necessary, but the output file may be used for other projects
-    p = 2;
-    fwrite(&p, sizeof(uint32_t), 1, outfile);
+    // Write total number of primes to first dword
+    fwrite(&p32count, sizeof(u32), 1, outfile);
 
-    //Fill up static pblock array with primes and flush to outfile when it hits BLOCK_SIZE
-    count = 0;
-    for(j = 0; j < 0x80000000; j++)
-    {
-        if(skip[j]) continue;
-
-        pblock[count] = 2 * j + 1;
-        count++;
-        if(count < BLOCK_SIZE) continue;
-
-        fwrite(pblock, sizeof(uint32_t), BLOCK_SIZE, outfile);
-        count = 0;
+    // Write
+    fwrite(primes16, sizeof(u32), p16count, outfile);
+    for (j = 0; j < num_chunks; ++j) {
+        fwrite(primes32[j], sizeof(u32), chunk_totals[j], outfile);
+        free(primes32[j]);
     }
 
-    //Write last pblock since the loop above ended on a composite number (2^64-1)
-    fwrite(pblock, sizeof(uint32_t), count, outfile);
-
-    free(skip);
+    free(primes32);
+    free(chunk_totals);
+    free(primes16);
+    free(keep);
     fclose(outfile);
     return 0;
 }
