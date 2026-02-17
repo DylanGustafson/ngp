@@ -56,4 +56,4 @@ echo "Write to file every : ${var_sep[3]}"
 echo "Output directory    : $outdir"
 echo "Log file path       : $logfile"
 
-nohup "./ngp-loop.sh" ${var[0]} ${var[1]} ${var[2]} ${var[3]} $outdir $logfile >> log2 2>&1 &
+nohup "./ngp-loop.sh" ${var[0]} ${var[1]} ${var[2]} ${var[3]} $outdir $logfile >> /dev/null 2>&1 &
