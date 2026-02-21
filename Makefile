@@ -1,4 +1,4 @@
-.PHONY: ngp
+.PHONY: ngp verbose gmp gmp-verbose
 
 CC = gcc
 LINKGMP = -lgmp
@@ -14,11 +14,25 @@ else
 endif
 
 ngp:
+	chmod +x ngp ngp-loop.sh check.py
 	rm -f ngp-bin psieve
 	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
-	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) ngp64.c $(LINKGMP)
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) ngp64.c
 
 verbose:
+	chmod +x ngp ngp-loop.sh check.py
 	rm -f ngp-bin psieve
 	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
-	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose ngp64.c $(LINKGMP)
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose ngp64.c
+
+gmp:
+	chmod +x ngp ngp-loop.sh check.py
+	rm -f ngp-bin psieve
+	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) ngp64gmp.c $(LINKGMP)
+
+gmp-verbose:
+	chmod +x ngp ngp-loop.sh check.py
+	rm -f ngp-bin psieve
+	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose ngp64gmp.c $(LINKGMP)

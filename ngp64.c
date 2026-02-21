@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>     // only needed for memcpy/memmove
-#include <gmp.h>        // GNU multiprecision arithmetic
 #include <omp.h>        // OpenMP
 
 // Number of bins used for q/N histogram
@@ -13,10 +12,14 @@
 // number of prime factors for a 64-bit int (eg: 693386350578511591)
 #define VECTOR_ALLOC 16
 
+#define low64 0xFFFFFFFFFFFFFFFFULL
+
 // Short aliases for fixed-width int types
 typedef __uint128_t u128;
 typedef uint64_t u64;
 typedef uint32_t u32;
+
+typedef struct{u64 x0; u64 x1; u64 x2; u64 x3;} u256;
 
 // Globals (initialized before parallel section) which remain constant across threads
 u64 block_start, block_size, chunk_size;
@@ -30,7 +33,6 @@ char* valid_shared;
 u64** vectors_shared;
 u64* vector_vals_shared;
 u64* qcounts_shared;
-mpz_t* mpz_shared;
 
 // Converts numeric string to u64 type, while also handling integer scientific notation
 u64 str_to_u64(char* str) {
@@ -310,13 +312,16 @@ void gen_exp_vectors(const u64 chunk_start, char* valid, u64** vectors, u64* vec
     } while (++i != max_pfacs);
 }
 
-// 64-bit REDC subroutine for Montgomery modular multiplication
+// 64-bit REDC implementation for Montgomery modular multiplication
 u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
     u64 result;
 
     // m = N * (a * b * N_inv % 2^64), but need to save 128-bit product t
     u128 t = (u128) a * b;
     u128 m = (u128) N * (u64)((u64)t * N_inv);
+
+    u64 th = (u64) (t >> 64);
+    u64 mh = (u64) (m >> 64);
 
     // arm64 specific instructions for calculating ((m + 1) >> 64) % N
     #if defined(__aarch64__)
@@ -338,45 +343,44 @@ u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
 
         return result;
 
-    // x86-64 specific instructions for calculating ((m + t) >> 64) % N
+    // x86-64 specific instructions for calculating ((m - t) >> 64) % N
     #else
         asm volatile goto (
-            "add     %[ml], %[tl]\n\t"          //  128-bit addition of m and t, which
-            "adc     %[mh], %[th]\n\t"          // affects the carry flag if it overflows
-            "mov     %[res], %[mh]\n\t"         // Store (m+t)>>64 into result var (%rax)
-            "jc      %l[over]\n\t"              // If sum overflowed, jump to label
-            "cmp     %[res], %[N]\n\t"          // Also need to jump there if
-            "jnb     %l[over]"                  //  result is not below p
+            "sub     %[mh], %[th]\n\t"
+            "jnc     %l[noadd]"
 
-            : [res] "=r" (result)
-            : [ml] "r" ((u64) m),
-              [mh] "r" ((u64) (m >> 64)),
-              [tl] "r" ((u64) t),
-              [th] "r" ((u64) (t >> 64)),
+            : [mh] "+r" (mh)
+            : [th] "r" (th)
+            : "cc"
+            : noadd
+        );
+
+        return mh + N;
+    noadd:
+        return mh;
+
+    /* Branchless version using cmov - slower!
+        asm volatile(
+            "sub     %[mh], %[th]\n\t"
+            "lea     %[res], [%[mh]+%[N]]\n\t"
+            "cmovnc  %[res], %[mh]"
+
+            : [res] "=r" (result),
+              [mh] "+r" (mh)
+            : [th] "r" (th),
               [N]  "r" (N)
             : "cc"
-            : over
         );
         return result;
-
-    over:
-        return result - N;
+    */
 
     #endif
 }
 
 // Finds the smallest positive primitive root of prime N using list of trial exponents.
-u64 get_min_pr(const u64 N, const u64* const exp_start, const u64* const exp_end) {
+u64 get_min_pr(const u64 N, const u64 N_inv, const u64 r128_N, const u64* const exp_start, const u64* const exp_end) {
     const u64* ptr;
     u64 exp, acc, res, root, start_mm;
-
-    // 2^128 % N
-    u64 R2modN = 1 + (u64) ((u128) -1 % N);
-
-    // Calculate the inverse (modulo 2^64) of negative N
-    u64 N_inv = (3 * -N) ^ 2;
-    for (int i = 0; i < 4; ++i)
-        N_inv *= (2 + N * N_inv);
 
     // Loop through root candidates, starting at 2
     root = 1;
@@ -388,7 +392,7 @@ u64 get_min_pr(const u64 N, const u64* const exp_start, const u64* const exp_end
             root += root / 4;
 
         // Convert root^2 in preparation for Montgomery modular multiplication
-        start_mm = redc64(root * root, R2modN, N, N_inv);
+        start_mm = redc64(root * root, r128_N, N, N_inv);
 
         // Loop through (N-1)/p values, starting with smaller p values as it breaks sooner
         ptr = exp_start;
@@ -423,9 +427,217 @@ u64 get_min_pr(const u64 N, const u64* const exp_start, const u64* const exp_end
     }
 }
 
+// Calculates the 256-bit product of two unsigned 128-bit ints
+u256 mult256(u128 a, u128 b) {
+    u256 res;
+
+    u64 al, ah, bl, bh;
+    u64 carry3, carry4;
+    u128 prd_00, prd_01, prd_10, prd_11, sum128;
+
+    //split a and b into 64-bit halves
+    al = (u64) a;
+    ah = (u64) (a >> 64);
+    bl = (u64) b;
+    bh = (u64) (b >> 64);
+
+    //Calculate 128-bit partial products
+    prd_00 = (u128) al * bl;
+    prd_01 = (u128) al * bh;
+    prd_10 = (u128) ah * bl;
+    prd_11 = (u128) ah * bh;
+
+    res.x0 = (u64) prd_00;
+
+    //128-bit sum of column 2, getting result & carry
+    sum128 = (prd_00 >> 64) + (prd_01 & low64) + (prd_10 & low64);
+    res.x1 = (u64) sum128;
+    carry3 = (u64) (sum128 >> 64);
+
+    //128-bit sum of column 3 (+ carry), getting result & carry
+    sum128 = carry3 + (prd_01 >> 64) + (prd_10 >> 64) + (prd_11 & low64);
+    res.x2 = (u64) sum128;
+    carry4 = (u64) (sum128 >> 64);
+
+    //64-bit sum of column 4 + carry, since it can't overflow
+    res.x3 = carry4 + (u64)(prd_11 >> 64);
+
+    return res;
+}
+
+//128-bit REDC implementation, no inline asm
+/*
+u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
+    u256 t = mult256(a, b);
+    u128 t_lo = ((u128) t.x1 << 64) + t.x0;
+    u128 t_hi = ((u128) t.x3 << 64) + t.x2;
+
+    u256 m = mult256(N2, t_lo * N2_inv);
+    u128 m_hi = ((u128) m.x3 << 64) + m.x2;
+
+    u128 result = t_hi - m_hi;
+    if (t_hi < m_hi)
+        result += N2;
+
+    return result;
+}
+*/
+
+// 128-bit REDC implementation for Montgomery modular multiplication
+u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
+    u256 t = mult256(a, b);
+
+    // Construct 128-bit high & low words of product
+    u128 t_lo = ((u128) t.x1 << 64) + t.x0;
+    u128 t_hi = ((u128) t.x3 << 64) + t.x2;
+
+    // Get the 128-bit high word of m = N2 * (t * N2_inv % 2^128)
+    u256 m = mult256(N2, t_lo * N2_inv);
+    u128 m_hi = ((u128) m.x3 << 64) + m.x2;
+
+    // Decompose furter into 64-bit high-high & high-low words for inline asm below
+    u64 t_hh = (u64) (t_hi >> 64);
+    u64 t_hl = (u64)  t_hi;
+    u64 m_hh = (u64) (m_hi >> 64);
+    u64 m_hl = (u64)  m_hi;
+    u64 N2_hi = (u64) (N2 >> 64);
+    u64 N2_lo = (u64)  N2;
+
+    // Subtract m_hi from t_hi, then add back N2 if it carried. This is
+    // more efficient via inline asm as it avoids a needless 128-bit cmp
+    asm volatile (
+        "sub     %[thl], %[mhl]\n\t"
+        "sbb     %[thh], %[mhh]\n\t"
+        "jnc     1f\n\t"
+        "add     %[thl], %[N2l]\n\t"
+        "adc     %[thh], %[N2h]\n\t"
+        "1:"
+        : [thl] "+r" (t_hl), [thh] "+r" (t_hh)
+        : [mhl] "r"  (m_hl), [mhh] "r"  (m_hh),
+          [N2l] "r" (N2_lo), [N2h] "r" (N2_hi)
+        : "cc"
+    );
+
+    // Rebuild the now-modified 128-bit t_hi
+    return ((u128) t_hh << 64) + t_hl;
+}
+
+u64 calc_q(u64 N, const u64* exp_start, const u64* exp_end) {
+    // Calculate modulo 2^128 multiplicative inverse of N
+    u128 Ni_128 = ((u128) N * 3) ^ 2;
+    u128 y = 1 - Ni_128 * N;
+
+    // Five steps are required to guarantee 128 bits
+    Ni_128 *= 1 + y;
+    y *= y;
+    Ni_128 *= 1 + y;
+    y *= y;
+    Ni_128 *= 1 + y;
+    y *= y;
+    Ni_128 *= 1 + y;
+    y *= y;
+    Ni_128 *= 1 + y;
+
+    // Modular inverses needed for 64- and 128-bit montgomery form conversion
+    u64 Ni_64 = (u64) Ni_128;
+    u128 N2i_128 = Ni_128 * Ni_128;
+
+    // Calculate 2^128 % N^2 as the first step towards the goal of 2^256 % N^2
+    u128 N2 = (u128) N * N;
+    u128 r128_N2 = 1 + (u128) -1 % N2;
+
+    // Calculate 2^128 % N and (2^128 % N^2 - 2^128 % N) / N
+    // using a single __udivmodti4 call
+    u64 r128_N = r128_N2 % N;
+    u64 quot = r128_N2 / N;
+
+    // Since r128_N and quot are both less than N, we can choose whether
+    // to multiply them or multiply their negatives modulo N. Using the
+    // smaller value guarantees that multiplying by 2 wont overflow
+    u128 prod1;
+    if ((N - quot) < quot)
+        prod1 = (u128) (N - r128_N) * ((N - quot) * 2);
+    else
+        prod1 = (u128) r128_N * (quot * 2);
+
+    // Calculate prod2 = r128_N * quot * 2 * N % N2
+    u64 mod1 = prod1 % N;
+    u128 prod2 = (u128) mod1 * N;
+
+    // Calculate the other product needed. Both products are less than N2.
+    // so instead of a final modulo N2 we only need to potentially subtract
+    // N2 once. However, since their sum can overflow past 2^128, its more
+    // efficient to subtract them (need to use the negative mod N2) and just
+    // add another N2 if the subtraction sets the carry flag
+    u128 prod3 = N2 - (u128) r128_N * r128_N;
+
+    // Decompose into 64-bit high & low words for inline assembly below
+    u64 p2h = (u64) (prod2 >> 64);
+    u64 p2l = (u64) prod2;
+    u64 p3h = (u64) (prod3 >> 64);
+    u64 p3l = (u64) prod3;
+    u64 N2h = (u64) (N2 >> 64);
+    u64 N2l = (u64)  N2;
+
+    // Subtract prod3 from prod2, then add back N2 if it carried. This is
+    // more efficient via inline asm as it avoids a needless 128-bit cmp
+    asm volatile (
+        "sub     %[p2l], %[p3l]\n\t"
+        "sbb     %[p2h], %[p3h]\n\t"
+        "jnc     1f\n\t"
+        "add     %[p2l], %[N2l]\n\t"
+        "adc     %[p2h], %[N2h]\n\t"
+        "1:"
+        : [p2l] "+r" (p2l), [p2h] "+r" (p2h)
+        : [p3l]  "r" (p3l), [p3h]  "r" (p3h),
+          [N2l]  "r" (N2l), [N2h]  "r" (N2h)
+        : "cc"
+    );
+
+    // Construct 2^256 % N^2 from the 64-bit high & low words
+    u128 r256_N2 = ((u128) p2h << 64) + p2l;
+
+    // Get the minimum primitive root of N
+    u64 root = get_min_pr(N, Ni_64, r128_N, exp_start, exp_end);
+
+    // Set up 128-bit exponentiation. The exponent (N) is guaranteed
+    // to be odd, so we can optimize past the first loop iteration
+    u128 acc = redc128(root * root, r256_N2, N2, N2i_128);
+    u128 res = root;
+    u64 exp = N >> 1;
+
+    // Use 128-bit montgomery exponentiation to calculate res = root^N % N^2
+    while(1) {
+        if(exp & 1)
+            res = redc128(acc, res, N2, N2i_128);
+
+        exp >>= 1;
+        if(exp == 0) break;
+
+        acc = redc128(acc, acc, N2, N2i_128);
+    }
+
+    // q = (root^N % N^2 - root) / N. Since this divides evenly, We
+    // can use the previously calculated 128-bit modular inverse of N
+    u64 q = (u64) ((res - root) * Ni_128);
+
+    // Print "N (root q) factor_list" for debugging
+    #ifdef verbose
+    #pragma omp critical
+    {
+        fprintf(stderr, "%lu (%lu %lu)", N, root, q);
+        for (int i = 0; i < exp_end - exp_start; ++i)
+            fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
+        fprintf(stderr, "\n");
+    }
+    #endif
+
+    return q;
+}
+
 // Thread entry point. Sieves primes, allcates exp vectors, calls the functions above
 void count_qvals(const u64 chunk_num) {
-    u64 j, N, root, half_N, vsize, q;
+    u64 j, vsize, half_N, N, q_val;
     u64 *exp_start, *exp_end;
     u64 chunk_start = block_start + chunk_size * chunk_num;
 
@@ -435,8 +647,6 @@ void count_qvals(const u64 chunk_num) {
     u64** vectors = vectors_shared + chunk_size * thread_num;
     u64* vector_vals = vector_vals_shared + vector_vals_size * thread_num;
     u64* qcounts = qcounts_shared + BIN_COUNT * thread_num;
-    mpz_t* m1 = mpz_shared + 2 * thread_num;
-    mpz_t* m2 = m1 + 1;
 
     #ifdef verbose
     #pragma omp critical
@@ -472,13 +682,13 @@ void count_qvals(const u64 chunk_num) {
     for (j = 0; j < chunk_size; ++j) {
         if (!valid[j]) continue;
 
-        // Calculate (N-1)/2
-        half_N = chunk_start + j;
-
         // Get start and end pointers for exponents
         vsize = vectors[j][0];
         exp_start = vectors[j] + 1;
         exp_end = vectors[j] + vsize;
+
+        // Calculate (N-1)/2
+        half_N = chunk_start + j;
 
         // The first actual value in each vector ("fprod") is HALF the product of all prime factors
         // of N-1 (with multiplicity) below sqrt(N-1). If ALL prime factors of N-1 are less than
@@ -493,40 +703,19 @@ void count_qvals(const u64 chunk_num) {
             *exp_start = half_N;
         }
 
-        // Find first primitive root of N
         N = 2 * half_N + 1;
-        root = get_min_pr(N, exp_start, exp_end);
-
-        // Use GMP to calculate q = (root ^ N % N^2 - root) / N
-        mpz_set_ui(*m1, root);
-        mpz_set_ui(*m2, N);
-        mpz_mul_ui(*m2, *m2, N);
-        mpz_powm_ui(*m1, *m1, N, *m2);
-        mpz_sub_ui(*m1, *m1, root);
-        mpz_divexact_ui(*m1, *m1, N);       // Faster than dividing by *m2 once
-        q = mpz_get_ui(*m1);
+        q_val = calc_q(N, exp_start, exp_end);
 
         // Print numbers of interest to stderr
-        if (__builtin_expect(q == 0, 0))
+        if (__builtin_expect(q_val == 0, 0))
             #pragma omp critical
-                fprintf(stderr, "Non-generous prime found! Value = %lu (%lu)\n", N, root);
-        else if (__builtin_expect(q == 1, 0))
+            fprintf(stderr, "Non-generous prime found! Value = %lu\n", N);
+        else if (__builtin_expect(q_val == 1, 0))
             #pragma omp critical
-                fprintf(stderr, "q = 1. Value = %lu (%lu)\n", N, root);
+            fprintf(stderr, "q = 1. Value = %lu\n", N);
 
         // Increment counter in q/N bin
-        qcounts[(u128)q * BIN_COUNT / N] += 1;
-
-        // Verbose output: Print N, root, q, and prime factors of N-1 to stderr
-        #ifdef verbose
-        #pragma omp critical
-        {
-            fprintf(stderr, "%lu (%lu %lu)", N, root, q);
-            for (int i = 0; i < exp_end - exp_start; ++i)
-                fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
-            fprintf(stderr, "\n");
-        }
-        #endif
+        qcounts[(u128)q_val * BIN_COUNT / N] += 1;
     }
 
     #ifdef verbose
@@ -639,11 +828,6 @@ int main(int argc, char **argv) {
     vector_vals_shared = (u64*) aligned_alloc(64, max_threads * vector_vals_size * sizeof(u64));
     qcounts_shared = (u64*) calloc(max_threads * BIN_COUNT, sizeof(u64));
 
-    // Allocate and initialize two mpz structs for each thread
-    mpz_shared = (mpz_t*) malloc(2 * max_threads * sizeof(mpz_t));
-    for (i = 0; i < 2 * max_threads; ++i)
-        mpz_init(mpz_shared[i]);
-
     // Exit if any allocation(s) failed
     if (!qcounts_shared || !valid_shared || !vectors_shared || !vector_vals_shared) {
         fprintf(stderr, "Error: couldn't allocate necessary memory (%lu GiB)\n", req_mem >> 30);
@@ -675,10 +859,6 @@ int main(int argc, char **argv) {
     }
 
     // Garbage collect
-    for (i = 0; i < 2 * max_threads; ++i)
-        mpz_clear(mpz_shared[i]);
-
-    free(mpz_shared);
     free(qcounts_shared);
     free(vector_vals_shared);
     free(vectors_shared);
