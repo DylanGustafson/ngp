@@ -1,3 +1,4 @@
+#!/bin/python3
 from sympy.ntheory.residue_ntheory import is_primitive_root
 from sympy.ntheory import isprime, primefactors
 from subprocess import run
@@ -19,16 +20,22 @@ def build_line(N):
 
 if len(sys.argv) == 1:
     fname = sys.argv[0]
+    if not fname.startswith("./"):
+        fname = "./" + fname
+
     print("Usage:")
-    print(f"  Check a single number        : python3 {fname} number")
-    print(f"  Check a stderr output file   : python3 {fname} file_name")
-    print(f"  Run ngp-bin and check output : python3 {fname} start_value total_size")
+    print(f"  Check a single number        : {fname} number")
+    print(f"  Check a stderr output file   : {fname} file_name")
+    print(f"  Run ngp-bin and check output : {fname} start_value total_size [chunk_size]")
     print("\nLine format: number (root q_value) pfac1 pfac2 ...")
     exit()
 
 elif len(sys.argv) > 2:
     run(["make", "verbose"])
     cmd = ["./ngp-bin"] + sys.argv[1:]
+    if len(sys.argv) == 3:
+        cmd += [sys.argv[2]]
+
     print("Running:", " ".join(cmd))
     output = run(cmd, capture_output=True, text=True).stderr
     print("Done!", end=" ")

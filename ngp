@@ -17,7 +17,6 @@ elif [ "$1" == "stop" ]; then
     exit
 fi
 
-chmod +x "ngp-loop.sh"
 make
 
 if [ ! -f primes.dat ]; then
