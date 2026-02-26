@@ -2,37 +2,49 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>     // only needed for memcpy/memmove
-#include <omp.h>        // OpenMP
+#include <string.h>
+#include <omp.h>
 
-// Number of bins used for q/N histogram
+// Number of bins used for q/N distribution (histogram)
 #define BIN_COUNT 1000
 
-// Allocation size for vector of (N-1)/p exponents. 15 is the maximum
-// number of prime factors for a 64-bit int (eg: 693386350578511591)
+// Allocation size (+1) for vector of (N-1)/p exponents. 15 is the maximum
+// number of distinct prime factors for a 64-bit int (eg: 693386350578511591)
 #define VECTOR_ALLOC 16
 
-#define low64 0xFFFFFFFFFFFFFFFFULL
+// Initial allocation size (+2) for maximum g(p) pairs
+#define GP_ALLOC 16
 
 // Short aliases for fixed-width int types
 typedef __uint128_t u128;
 typedef uint64_t u64;
 typedef uint32_t u32;
 
+// Little-endian 256-bit unsigned int
 typedef struct{u64 x0; u64 x1; u64 x2; u64 x3;} u256;
+
+// get_rq returns two 64-bit values, and this way avoids using the stack
+typedef struct{u64 root; u64 q_val;} u64_pair;
+
+// Static I/O file names
+const char primes_fname[] = "primes.dat";
+const char ngps_fname[] = "output/ngps.txt";
+const char gpms_fname[] = "output/gp-max.csv";
 
 // Globals (initialized before parallel section) which remain constant across threads
 u64 block_start, block_size, chunk_size;
 u64 vector_vals_size;
+u64 gp_max;
 u32 max_pfacs;
 u32* primes;
-const char* primes_file = "primes.dat";
+FILE* ngps_file;
 
 // Pointers to thread-partitioned arrays for safe parallel read/write
 char* valid_shared;
 u64** vectors_shared;
 u64* vector_vals_shared;
 u64* qcounts_shared;
+u64** gp_pairs_shared;
 
 // Converts numeric string to u64 type, while also handling integer scientific notation
 u64 str_to_u64(char* str) {
@@ -46,6 +58,7 @@ u64 str_to_u64(char* str) {
         if (str[i] == 0)
             return num;
 
+        // Multiply by 10 and add new digit while checking for overflow
         overflow = __builtin_mul_overflow(num, 10, &num);
         overflow |= __builtin_add_overflow(num, str[i] - '0', &num);
         if (overflow) {
@@ -85,11 +98,8 @@ u64 estimate_nprimes(u64 start, u64 diff) {
     else
         result /= (62 - __builtin_clzll(diff));
 
-    //In extreme cases, just use 1000
-    if (result < 1000)
-        return 1000;
-
-    return result;
+    // Always return at least 1000
+    return (result < 1000) ? 1000 : result;
 }
 
 // Calculates a rough overestimate of sqrt(n)
@@ -105,24 +115,30 @@ u32 int_sqrt(u64 n) {
         mag = (64 - clz) / 2;
         sn = ((u32)1 << (mag - 1)) + (u32)(n >> (mag + 1));
     }
-    return sn / 2 + n / sn / 2;   // One final iteration, avoiding overflow
+
+    // One final iteration, avoiding overflow
+    return sn / 2 + n / sn / 2;
 }
 
 // Reads in primes below 2^32 from primes.dat
 void load_primes(u64 N_max) {
     u32 pfile_size, max_read, pmax;
 
-    // fprintf(stderr, "Loading primes\n"); fflush(stderr);
+    #ifdef verbose
+        fprintf(stderr, "Loading primes\n");
+        fflush(stderr);
+    #endif
+
     // Open primes.dat to get primes needed for sieve
-    FILE* pfile = fopen(primes_file, "rb");
+    FILE* pfile = fopen(primes_fname, "rb");
     if (pfile == NULL) {
-        fprintf(stderr, "Error: could not find \"%s\" - run ./psieve first\n", primes_file);
+        fprintf(stderr, "Error: could not find \"%s\" - run ./psieve first\n", primes_fname);
         exit(1);
     }
 
     // First 4 bytes is total number of primes
     if (fread(&pfile_size, sizeof(u32), 1, pfile) != 1) {
-        fprintf(stderr, "Format error in \"%s\"\n", primes_file);
+        fprintf(stderr, "Format error in \"%s\"\n", primes_fname);
         exit(1);
     }
 
@@ -378,7 +394,7 @@ u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
 }
 
 // Finds the smallest positive primitive root of prime N using list of trial exponents.
-u64 get_min_pr(const u64 N, const u64 N_inv, const u64 r128_N, const u64* const exp_start, const u64* const exp_end) {
+u64 get_min_pr(u64 N, u64 N_inv, u64 r128_N, const u64* const exp_start, const u64* const exp_end) {
     const u64* ptr;
     u64 exp, acc, res, root, start_mm;
 
@@ -430,36 +446,36 @@ u64 get_min_pr(const u64 N, const u64 N_inv, const u64 r128_N, const u64* const 
 // Calculates the 256-bit product of two unsigned 128-bit ints
 u256 mult256(u128 a, u128 b) {
     u256 res;
-
     u64 al, ah, bl, bh;
     u64 carry3, carry4;
     u128 prd_00, prd_01, prd_10, prd_11, sum128;
 
-    //split a and b into 64-bit halves
+    // Split a and b into 64-bit halves
     al = (u64) a;
     ah = (u64) (a >> 64);
     bl = (u64) b;
     bh = (u64) (b >> 64);
 
-    //Calculate 128-bit partial products
+    // Calculate 128-bit partial products
     prd_00 = (u128) al * bl;
     prd_01 = (u128) al * bh;
     prd_10 = (u128) ah * bl;
     prd_11 = (u128) ah * bh;
 
+    // Lowest word comes straight from last 64 bits of prd_00
     res.x0 = (u64) prd_00;
 
-    //128-bit sum of column 2, getting result & carry
-    sum128 = (prd_00 >> 64) + (prd_01 & low64) + (prd_10 & low64);
+    // 128-bit sum of column 2, getting result & carry
+    sum128 = (prd_00 >> 64) + (prd_01 & (u64)-1) + (prd_10 & (u64)-1);
     res.x1 = (u64) sum128;
     carry3 = (u64) (sum128 >> 64);
 
-    //128-bit sum of column 3 (+ carry), getting result & carry
-    sum128 = carry3 + (prd_01 >> 64) + (prd_10 >> 64) + (prd_11 & low64);
+    // 128-bit sum of column 3 (+ carry), getting result & carry
+    sum128 = carry3 + (prd_01 >> 64) + (prd_10 >> 64) + (prd_11 & (u64)-1);
     res.x2 = (u64) sum128;
     carry4 = (u64) (sum128 >> 64);
 
-    //64-bit sum of column 4 + carry, since it can't overflow
+    // 64-bit sum of column 4 + carry, since it can't overflow
     res.x3 = carry4 + (u64)(prd_11 >> 64);
 
     return res;
@@ -522,7 +538,8 @@ u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
     return ((u128) t_hh << 64) + t_hl;
 }
 
-u64 calc_q(u64 N, const u64* exp_start, const u64* exp_end) {
+// Calculates parameters needed for 64- and 128-bit REDC, then gets the root and calculates q
+u64_pair get_rq(u64 N, const u64* exp_start, const u64* exp_end) {
     // Calculate modulo 2^128 multiplicative inverse of N
     u128 Ni_128 = ((u128) N * 3) ^ 2;
     u128 y = 1 - Ni_128 * N;
@@ -568,7 +585,7 @@ u64 calc_q(u64 N, const u64* exp_start, const u64* exp_end) {
     // so instead of a final modulo N2 we only need to potentially subtract
     // N2 once. However, since their sum can overflow past 2^128, its more
     // efficient to subtract them (need to use the negative mod N2) and just
-    // add another N2 if the subtraction sets the carry flag
+    // add another N2 if the final subtraction sets the carry flag
     u128 prod3 = N2 - (u128) r128_N * r128_N;
 
     // Decompose into 64-bit high & low words for inline assembly below
@@ -607,12 +624,12 @@ u64 calc_q(u64 N, const u64* exp_start, const u64* exp_end) {
     u64 exp = N >> 1;
 
     // Use 128-bit montgomery exponentiation to calculate res = root^N % N^2
-    while(1) {
-        if(exp & 1)
+    while (1) {
+        if (exp & 1)
             res = redc128(acc, res, N2, N2i_128);
 
         exp >>= 1;
-        if(exp == 0) break;
+        if (exp == 0) break;
 
         acc = redc128(acc, acc, N2, N2i_128);
     }
@@ -632,14 +649,16 @@ u64 calc_q(u64 N, const u64* exp_start, const u64* exp_end) {
     }
     #endif
 
-    return q;
+    u64_pair return_pair = {root, q};
+    return return_pair;
 }
 
 // Thread entry point. Sieves primes, allcates exp vectors, calls the functions above
 void count_qvals(const u64 chunk_num) {
-    u64 j, vsize, half_N, N, q_val;
+    u64 j, vsize, half_N, N, root, q_val, new_cap;
     u64 *exp_start, *exp_end;
     u64 chunk_start = block_start + chunk_size * chunk_num;
+    u64_pair rq;
 
     // Get pointers to thread-specific write locations
     int thread_num = omp_get_thread_num();
@@ -647,6 +666,12 @@ void count_qvals(const u64 chunk_num) {
     u64** vectors = vectors_shared + chunk_size * thread_num;
     u64* vector_vals = vector_vals_shared + vector_vals_size * thread_num;
     u64* qcounts = qcounts_shared + BIN_COUNT * thread_num;
+
+    // Set up thread-local array of g(p) max pairs. Use most recent max value if possible
+    u64 gp_thread_max = gp_max;
+    u64* gp_pairs = gp_pairs_shared[thread_num];
+    if (gp_pairs[0] > 2 && gp_pairs[gp_pairs[0] - 2] < 2 * chunk_start)
+        gp_thread_max = gp_pairs[gp_pairs[0] - 1];
 
     #ifdef verbose
     #pragma omp critical
@@ -687,8 +712,9 @@ void count_qvals(const u64 chunk_num) {
         exp_start = vectors[j] + 1;
         exp_end = vectors[j] + vsize;
 
-        // Calculate (N-1)/2
+        // Calculate (N-1)/2 and N
         half_N = chunk_start + j;
+        N = 2 * half_N + 1;
 
         // The first actual value in each vector ("fprod") is HALF the product of all prime factors
         // of N-1 (with multiplicity) below sqrt(N-1). If ALL prime factors of N-1 are less than
@@ -703,19 +729,48 @@ void count_qvals(const u64 chunk_num) {
             *exp_start = half_N;
         }
 
-        N = 2 * half_N + 1;
-        q_val = calc_q(N, exp_start, exp_end);
+        // Calculate the minimum primitive root and q value
+        rq = get_rq(N, exp_start, exp_end);
+        root = rq.root;
+        q_val = rq.q_val;
+
+        // Increment counter in q/N bin
+        qcounts[(u128)q_val * BIN_COUNT / N] += 1;
 
         // Print numbers of interest to stderr
         if (__builtin_expect(q_val == 0, 0))
             #pragma omp critical
-            fprintf(stderr, "Non-generous prime found! Value = %lu\n", N);
+                fprintf(ngps_file, "q = 0. Value = %lu (%lu)\n", N, root);
         else if (__builtin_expect(q_val == 1, 0))
             #pragma omp critical
-            fprintf(stderr, "q = 1. Value = %lu\n", N);
+                fprintf(ngps_file, "q = 1. Value = %lu (%lu)\n", N, root);
+        else if (__builtin_expect(q_val == N - 1, 0))
+            #pragma omp critical
+                fprintf(ngps_file, "q = -1. Value = %lu (%lu)\n", N, root);
 
-        // Increment counter in q/N bin
-        qcounts[(u128)q_val * BIN_COUNT / N] += 1;
+
+        // Only proceed if the root is larger than any previous roots
+        if (root <= gp_thread_max)
+            continue;
+
+        #ifdef verbose
+        #pragma omp critical
+            fprintf(stderr, "New maximum root for g(p): %lu (%lu)\n", root, N);
+        #endif
+
+        // Reallocate g(p) array if size == capacity
+        if (gp_pairs[0] == gp_pairs[1]) {
+            new_cap = gp_pairs[1] * 2;
+            gp_pairs = (u64*) realloc(gp_pairs, new_cap * sizeof(u64));
+            gp_pairs_shared[thread_num] = gp_pairs;
+            gp_pairs[1] = new_cap;
+        }
+
+        // Add N and root to gp_pairs, then update its size and the new (thread) maximum root
+        gp_pairs[gp_pairs[0]] = N;
+        gp_pairs[gp_pairs[0] + 1] = root;
+        gp_pairs[0] += 2;
+        gp_thread_max = root;
     }
 
     #ifdef verbose
@@ -730,22 +785,54 @@ void count_qvals(const u64 chunk_num) {
 // Main entry point. Reads in start, block_size and chunk_size from argv, then splits
 // the total range by chunk_size to be divided amongst parallel threads using OpenMP.
 int main(int argc, char **argv) {
-    u64 req_mem, primes_in_chunk, i, j;
+    u64 new_u64, i, j;
 
     // Parse arguments, if any
-    if (argc < 4) {
+    if (argc < 2) {
         puts("64-Bit Non-Generous Prime Searcher by Dylan G.\n");
-        puts("Usage: ngp [m|c] [p=nprimes] start_value total_size chunk_size");
-        puts("    m: Only return predicted memory usage for given args");
-        puts("    c: Format output as csv - defaults to tabular output");
-        puts("    p: Specify number of primes per chunk (for malloc) - defaults to PNT estimate");
+        puts("Usage: ngp-bin [c|m] [p=value] [g=value] start_value total_size [chunk_size]\n");
+        puts("Options:");
+        puts("   c: Format output as csv - defaults to tabular output");
+        puts("   m: Only return predicted memory usage and output filename for given args");
+        puts("   p: Specify number of primes per chunk (for malloc) - defaults to PNT estimate");
+        puts("   g: Specify starting root value from which to save max g(p) values");
         return 0;
     }
 
-    // Read in numerical inputs
-    block_start = str_to_u64(argv[argc - 3]) / 2;
-    block_size = str_to_u64(argv[argc - 2]) / 2;
-    chunk_size = str_to_u64(argv[argc - 1]) / 2;
+    // Defatul values
+    gp_max = 1;
+    char output_format = 0;
+    u64 primes_in_chunk = 0;
+    int direct_argc = 0;
+
+    // Parse argv
+    for (i = 1; i < argc; ++i) {
+        // Parse flags
+        if (argv[i][0] == 'm' || argv[i][0] == 'c') {
+            output_format = argv[i][0];
+            continue;
+        }
+
+        // Parse options
+        if (argv[i][0] == 'p' && argv[i][1] == '=') {
+            primes_in_chunk = str_to_u64(&argv[i][2]);
+            continue;
+        } else if (argv[i][0] == 'g' && argv[i][1] == '=') {
+            gp_max = str_to_u64(&argv[i][2]);
+            continue;
+        }
+
+        // Parse directs numerical args
+        new_u64 = str_to_u64(argv[i]) / 2;
+        if (direct_argc == 0)
+            block_start = new_u64;
+        else if (direct_argc == 1) {
+            block_size = new_u64;
+            chunk_size = new_u64;
+        } else
+            chunk_size = new_u64;
+        ++direct_argc;
+    }
 
     u64 N_min = 2 * block_start;
     u64 N_max = N_min + 2 * block_size;
@@ -771,15 +858,15 @@ int main(int argc, char **argv) {
         add_2357 = 1;
 
         // For 1 trillion, split into 974205 chunks
-        if (block_size == 1e12 / 2 - 5)
+        if (block_size == 499999999995)
             chunk_size = 513239;
 
         // For 1 billion, split into 10001 chunks
-        else if (block_size == 1e9 / 2 - 5)
+        else if (block_size == 499999995)
             chunk_size = 49995;
 
         //For 10 million or less, just use a single thread
-        else if (block_size < 1e7 / 2)
+        else if (block_size < 5000000)
             chunk_size = block_size;
 
         // Otherwise exit
@@ -789,7 +876,7 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "Changed args to %lu %lu %lu (p < 10 data will be added later)\n",
-                block_start * 2, block_size * 2, chunk_size * 2);
+                                         block_start * 2, block_size * 2, chunk_size * 2);
     }
 
     // Check if there will be an integer number of chunks
@@ -799,23 +886,36 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // If number of primes in chunk was not given, estimate using PNT
-    if (argv[argc - 4][0] == 'p')
-        primes_in_chunk = str_to_u64(&argv[argc - 4][2]);
+    // Set distribution output file name
+    char dist_fname[32];
+    if (N_max >= 1000000000000)
+        snprintf(dist_fname, sizeof(dist_fname), "output/%05lue12-to-%05lue12.csv",
+                                                 N_min / 1000000000000, N_max / 1000000000000);
+    else if (N_max >= 1000000)
+        snprintf(dist_fname, sizeof(dist_fname), "output/%05lue06-to-%05lue06.csv",
+                                                 N_min / 1000000, N_max / 1000000);
     else
+        snprintf(dist_fname, sizeof(dist_fname), "output/%08lu-to-%08lu.csv", N_min, N_max);
+
+    // If number of primes in chunk was not given, estimate using PNT
+    if (primes_in_chunk == 0)
         primes_in_chunk = estimate_nprimes(N_min, chunk_size * 2);
 
     vector_vals_size = primes_in_chunk * VECTOR_ALLOC;
 
-    // Predict memory usage
+    // Predict memory usage: 32-bit primes + #threads * (sum of thread-specific memory)
     int max_threads = omp_get_max_threads();
-    req_mem = 8e8 + max_threads * (
-        BIN_COUNT * sizeof(u64) +
-        chunk_size * (sizeof(u64*) + 1) +
-        vector_vals_size * sizeof(u64));
+    u64 req_mem = 813120884 + max_threads * (
+        chunk_size * (sizeof(u64*) + 1) +       // valid (char[]) and vector (ptr[])
+        vector_vals_size * sizeof(u64) +        // vector_vals (u64[])
+        BIN_COUNT * sizeof(u64) +               // qcounts (u64[])
+        GP_ALLOC * sizeof(u64) + sizeof(u64*)   // gp_pairs (u64[] and ptr[])
+    );
 
-    if (argv[1][0] == 'm') {
+    // If user passed 'm' flag, display memory usage and exit
+    if (output_format == 'm') {
         fprintf(stderr, "Predicted usage: %lu MiB\n", req_mem >> 20);
+        fprintf(stderr, "Output filename: %s\n", dist_fname);
         return 0;
     }
 
@@ -828,11 +928,24 @@ int main(int argc, char **argv) {
     vector_vals_shared = (u64*) aligned_alloc(64, max_threads * vector_vals_size * sizeof(u64));
     qcounts_shared = (u64*) calloc(max_threads * BIN_COUNT, sizeof(u64));
 
-    // Exit if any allocation(s) failed
+    // Exit now if any of these big allocation(s) failed
     if (!qcounts_shared || !valid_shared || !vectors_shared || !vector_vals_shared) {
         fprintf(stderr, "Error: couldn't allocate necessary memory (%lu GiB)\n", req_mem >> 30);
         return 1;
     }
+
+    // Initialize a dynamically-sized array for each thread
+    gp_pairs_shared = (u64**) malloc(max_threads * sizeof(u64*));
+    for (i = 0; i < max_threads; ++i) {
+        gp_pairs_shared[i] = (u64*) malloc(GP_ALLOC * sizeof(u64));
+
+        // Initialize size and capacity of array
+        gp_pairs_shared[i][0] = 2;               //size
+        gp_pairs_shared[i][1] = GP_ALLOC;        //capacity
+    }
+
+    // Open ngps file now since threads may write to it
+    ngps_file = fopen(ngps_fname, "a");
 
     // Split chunks among threads using guided schedule since higher chunks contain fewer primes
     #pragma omp parallel for schedule(guided)
@@ -841,24 +954,47 @@ int main(int argc, char **argv) {
 
     // If 0 - 10 was skipped, add in hard-coded q/N values for 2, 3, 5, and 7
     if (add_2357) {
-        qcounts_shared[0]++;
-        qcounts_shared[2 * BIN_COUNT / 3]++;
-        qcounts_shared[1 * BIN_COUNT / 5]++;
-        qcounts_shared[4 * BIN_COUNT / 7]++;
+        ++qcounts_shared[0];
+        ++qcounts_shared[2 * BIN_COUNT / 3];
+        ++qcounts_shared[1 * BIN_COUNT / 5];
+        ++qcounts_shared[4 * BIN_COUNT / 7];
     }
 
-    // Add up totals from each thread and format to stdout
+    // Add up q/N totals from each thread and write to distribution file
+    FILE* dist_file = fopen(dist_fname, "w");
     for (j = 0; j < BIN_COUNT; ++j) {
         for (i = 1; i < max_threads; ++i)
             qcounts_shared[j] += (qcounts_shared + i * BIN_COUNT)[j];
 
         if (argv[1][0] == 'c')
-            printf("%lu,", qcounts_shared[j]);
+            fprintf(dist_file, "%lu,", qcounts_shared[j]);
         else
-            printf("0.%03lu: %lu\n", j, qcounts_shared[j]);
+            fprintf(dist_file, "0.%03lu: %lu\n", j, qcounts_shared[j]);
     }
 
+    // Write g(p) max values to file
+    FILE* gpms_file = fopen(gpms_fname, "a");
+    for (i = 0; i < max_threads; ++i) {
+        for (j = 2; j < gp_pairs_shared[i][0]; j += 2)
+            fprintf(gpms_file, "%lu,%lu,\n", gp_pairs_shared[i][j], gp_pairs_shared[i][j + 1]);
+
+        // Update absolute maximum
+        if (gp_pairs_shared[i][j - 1] > gp_max)
+            gp_max = gp_pairs_shared[i][j - 1];
+
+        free(gp_pairs_shared[i]);
+    }
+
+    // Print maximum g(p) value to stdout for next round
+    printf("%lu\n", gp_max);
+
+    // Close output files
+    fclose(gpms_file);
+    fclose(dist_file);
+    fclose(ngps_file);
+
     // Garbage collect
+    free(gp_pairs_shared);
     free(qcounts_shared);
     free(vector_vals_shared);
     free(vectors_shared);
