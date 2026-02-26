@@ -18,8 +18,7 @@ elif [ "$1" == "stop" ]; then
     exit
 fi
 
-# Build executables and make output directory
-make
+# Make output directory
 outdir="./output"
 if [ ! -d $outdir ]; then
     mkdir $outdir
