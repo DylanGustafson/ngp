@@ -29,10 +29,10 @@ gmp:
 	chmod +x ngp ngp-loop.sh check.py
 	rm -f ngp-bin psieve
 	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
-	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) ngp64gmp.c $(LINKGMP)
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dgmp ngp64.c $(LINKGMP)
 
 gmp-verbose:
 	chmod +x ngp ngp-loop.sh check.py
 	rm -f ngp-bin psieve
 	$(CC) -o psieve -O3 -fopenmp -march=native psieve32.c
-	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose ngp64gmp.c $(LINKGMP)
+	$(CC) -o ngp-bin -O3 -fopenmp -march=native $(MASM) -Dverbose -Dgmp ngp64.c $(LINKGMP)

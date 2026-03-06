@@ -5,6 +5,10 @@
 #include <string.h>
 #include <omp.h>
 
+#ifdef gmp
+#include <gmp.h>
+#endif
+
 // Number of bins used for q/N distribution (histogram)
 #define BIN_COUNT 1000
 
@@ -45,6 +49,13 @@ u64** vectors_shared;
 u64* vector_vals_shared;
 u64* qcounts_shared;
 u64** gp_pairs_shared;
+
+#ifdef gmp
+mpz_t* mpz_shared;
+#endif
+
+// Declaration of __udivmodti4 (linker will find it in libgcc)
+u128 __udivmodti4(u128 n, u128 d, u128 *rem);
 
 // Converts numeric string to u64 type, while also handling integer scientific notation
 u64 str_to_u64(char* str) {
@@ -111,7 +122,7 @@ u32 int_sqrt(u64 n) {
         // Linear approximation of sqrt(x) near 4294967296
         sn = 0x80000000 + (n >> 33);
     else {
-        // Find closet power of 2 to sqrt(n), then do a Newton iteration
+        // Find closest power of 2 to sqrt(n), then do a Newton iteration
         mag = (64 - clz) / 2;
         sn = ((u32)1 << (mag - 1)) + (u32)(n >> (mag + 1));
     }
@@ -339,58 +350,54 @@ u64 redc64(u64 a, u64 b, u64 N, u64 N_inv) {
     u64 th = (u64) (t >> 64);
     u64 mh = (u64) (m >> 64);
 
-    // arm64 specific instructions for calculating ((m + 1) >> 64) % N
-    #if defined(__aarch64__)
-        asm volatile(
-            "adds     x5, %[ml], %[tl]\n\t"     // 128-bit addition of m and t, which stores
-            "adcs     x6, %[mh], %[th]\n\t"     // (m+t)>>64 into x6 and affects carry flag
-            "sub      x5, x6, %[N]\n\t"         // Save ((m+t)>>64) - N into x5 in case it's needed
-            "ccmp     x6, %[N], 2, cc\n\t"      // If m+t didnt carry, check if x6 > N, otherwise set carry
-            "csel     %[res], x5, x6, hi"       // If x6 > N or carry flag had been cleared, subtract N
+#if defined(__aarch64__)
+    // arm64 specific instructions for calculating ((mh - th) >> 64) % N
+    asm volatile(
+        "subs    x5, %[mh], %[th]\n\t"
+        "add     x6, x5, %[N]\n\t"
+        "csel    %[res], x6, x5, cc"
 
-            : [res] "=r" (result)
-            : [ml] "r" ((u64) m),
-              [mh] "r" ((u64) (m >> 64)),
-              [tl] "r" ((u64) t),
-              [th] "r" ((u64) (t >> 64)),
-              [N]  "r" (N)
-            : "x5", "x6"                        // Since x0 - x3 are input args and x4 was used to calculate m
-        );
+        : [res] "=r" (result)
+        : [mh] "r" (mh),
+          [th] "r" (th),
+          [N]  "r" (N)
+        : "x5", "x6"
+    );
 
-        return result;
+    return result;
 
-    // x86-64 specific instructions for calculating ((m - t) >> 64) % N
-    #else
-        asm volatile goto (
-            "sub     %[mh], %[th]\n\t"
-            "jnc     %l[noadd]"
+#else
+    // x86-64 specific instructions for calculating ((mh - th) >> 64) % N
+    asm volatile goto (
+        "sub     %[mh], %[th]\n\t"
+        "jnc     %l[noadd]"
 
-            : [mh] "+r" (mh)
-            : [th] "r" (th)
-            : "cc"
-            : noadd
-        );
+        : [mh] "+r" (mh)
+        : [th] "r" (th)
+        : "cc"
+        : noadd
+    );
 
-        return mh + N;
-    noadd:
-        return mh;
+    return mh + N;
+noadd:
+    return mh;
 
-    /* Branchless version using cmov - slower!
-        asm volatile(
-            "sub     %[mh], %[th]\n\t"
-            "lea     %[res], [%[mh]+%[N]]\n\t"
-            "cmovnc  %[res], %[mh]"
+#endif
 
-            : [res] "=r" (result),
-              [mh] "+r" (mh)
-            : [th] "r" (th),
-              [N]  "r" (N)
-            : "cc"
-        );
-        return result;
+    /*// Branchless x86-64 version using cmov - slower!
+    asm volatile(
+        "sub     %[mh], %[th]\n\t"
+        "lea     %[res], [%[mh]+%[N]]\n\t"
+        "cmovnc  %[res], %[mh]"
+
+        : [res] "=r" (result),
+          [mh] "+r" (mh)
+        : [th] "r" (th),
+          [N]  "r" (N)
+        : "cc"
+    );
+    return result;
     */
-
-    #endif
 }
 
 // Finds the smallest positive primitive root of prime N using list of trial exponents.
@@ -511,7 +518,16 @@ u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
     u256 m = mult256(N2, t_lo * N2_inv);
     u128 m_hi = ((u128) m.x3 << 64) + m.x2;
 
-    // Decompose furter into 64-bit high-high & high-low words for inline asm below
+#if defined(__aarch64__)
+    // arm64 (no inline asm) - subtract m_hi from t_hi, and add N2 if it overflowed
+    if (__builtin_sub_overflow(t_hi, m_hi, &t_hi))
+        t_hi += N2;
+
+    return t_hi;
+
+#else
+    // x86-64 - inline asm for more efficient overflow check
+    // Decompose t_hi and m_hi furter into 64-bit high-high & high-low words
     u64 t_hh = (u64) (t_hi >> 64);
     u64 t_hl = (u64)  t_hi;
     u64 m_hh = (u64) (m_hi >> 64);
@@ -519,7 +535,7 @@ u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
     u64 N2_hi = (u64) (N2 >> 64);
     u64 N2_lo = (u64)  N2;
 
-    // Subtract m_hi from t_hi, then add back N2 if it carried. This is
+    // Subtract m_hi from t_hi, then add back N2 if it overflowed. This is
     // more efficient via inline asm as it avoids a needless 128-bit cmp
     asm volatile (
         "sub     %[thl], %[mhl]\n\t"
@@ -536,6 +552,7 @@ u128 redc128(u128 a, u128 b, u128 N2, u128 N2_inv) {
 
     // Rebuild the now-modified 128-bit t_hi
     return ((u128) t_hh << 64) + t_hl;
+#endif
 }
 
 // Calculates parameters needed for 64- and 128-bit REDC, then gets the root and calculates q
@@ -565,29 +582,37 @@ u64_pair get_rq(u64 N, const u64* exp_start, const u64* exp_end) {
 
     // Calculate 2^128 % N and (2^128 % N^2 - 2^128 % N) / N
     // using a single __udivmodti4 call
-    u64 r128_N = r128_N2 % N;
-    u64 quot = r128_N2 / N;
+    u128 remainder;
+    u64 quot = (u64) __udivmodti4(r128_N2, N, &remainder);
+    u64 r128_N = (u64) remainder;
 
-    // Since r128_N and quot are both less than N, we can choose whether
-    // to multiply them or multiply their negatives modulo N. Using the
-    // smaller value guarantees that multiplying by 2 wont overflow
+    // Since r128_N and quot are both less than N, we can choose whether to
+    // multiply them or multiply their negatives modulo N. Using the smaller
+    // value guarantees that multiplying by 2 wont overflow. In etiher case, the
+    // result is also negated modulo N by subtracting exactly one operand from N
     u128 prod1;
     if ((N - quot) < quot)
-        prod1 = (u128) (N - r128_N) * ((N - quot) * 2);
+        prod1 = (u128) r128_N * ((N - quot) * 2);
     else
-        prod1 = (u128) r128_N * (quot * 2);
+        prod1 = (u128) (N - r128_N) * (quot * 2);
 
     // Calculate prod2 = r128_N * quot * 2 * N % N2
     u64 mod1 = prod1 % N;
     u128 prod2 = (u128) mod1 * N;
 
-    // Calculate the other product needed. Both products are less than N2.
-    // so instead of a final modulo N2 we only need to potentially subtract
-    // N2 once. However, since their sum can overflow past 2^128, its more
-    // efficient to subtract them (need to use the negative mod N2) and just
-    // add another N2 if the final subtraction sets the carry flag
-    u128 prod3 = N2 - (u128) r128_N * r128_N;
+    // Calculate the other product needed for the final subtraction step. Both
+    // products are less than N2, so instead of a final modulo N2, we only need
+    // to potentially add N2 back once when there is borrow overflow
+    u128 prod3 = (u128) r128_N * r128_N;
+    u128 r256_N2;
 
+#if defined(__aarch64__)
+    // arm64 - no inline asm needed. prod3 - prod2, plus N2 if overflow
+    if (__builtin_sub_overflow(prod3, prod2, &r256_N2))
+        r256_N2 += N2;
+
+#else
+    // x86-64 - inline asm for more efficient overflow check
     // Decompose into 64-bit high & low words for inline assembly below
     u64 p2h = (u64) (prod2 >> 64);
     u64 p2l = (u64) prod2;
@@ -596,23 +621,25 @@ u64_pair get_rq(u64 N, const u64* exp_start, const u64* exp_end) {
     u64 N2h = (u64) (N2 >> 64);
     u64 N2l = (u64)  N2;
 
-    // Subtract prod3 from prod2, then add back N2 if it carried. This is
-    // more efficient via inline asm as it avoids a needless 128-bit cmp
+    // Subtract prod2 from prod3, then add back N2 if it carried. This is
+    // more efficient via inline asm as it avoids a needless 128-bit cmp,
+    // and using a jump is faster than two cmov instructions
     asm volatile (
-        "sub     %[p2l], %[p3l]\n\t"
-        "sbb     %[p2h], %[p3h]\n\t"
+        "sub     %[p3l], %[p2l]\n\t"
+        "sbb     %[p3h], %[p2h]\n\t"
         "jnc     1f\n\t"
-        "add     %[p2l], %[N2l]\n\t"
-        "adc     %[p2h], %[N2h]\n\t"
+        "add     %[p3l], %[N2l]\n\t"
+        "adc     %[p3h], %[N2h]\n\t"
         "1:"
-        : [p2l] "+r" (p2l), [p2h] "+r" (p2h)
-        : [p3l]  "r" (p3l), [p3h]  "r" (p3h),
+        : [p3l] "+r" (p3l), [p3h] "+r" (p3h)
+        : [p2l]  "r" (p2l), [p2h]  "r" (p2h),
           [N2l]  "r" (N2l), [N2h]  "r" (N2h)
         : "cc"
     );
 
-    // Construct 2^256 % N^2 from the 64-bit high & low words
-    u128 r256_N2 = ((u128) p2h << 64) + p2l;
+    // Construct 2^256 % N^2 from the modified 64-bit high & low words
+    r256_N2 = ((u128) p3h << 64) + p3l;
+#endif
 
     // Get the minimum primitive root of N
     u64 root = get_min_pr(N, Ni_64, r128_N, exp_start, exp_end);
@@ -638,8 +665,8 @@ u64_pair get_rq(u64 N, const u64* exp_start, const u64* exp_end) {
     // can use the previously calculated 128-bit modular inverse of N
     u64 q = (u64) ((res - root) * Ni_128);
 
+#ifdef verbose
     // Print "N (root q) factor_list" for debugging
-    #ifdef verbose
     #pragma omp critical
     {
         fprintf(stderr, "%lu (%lu %lu)", N, root, q);
@@ -647,11 +674,61 @@ u64_pair get_rq(u64 N, const u64* exp_start, const u64* exp_end) {
             fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
         fprintf(stderr, "\n");
     }
-    #endif
+#endif
 
     u64_pair return_pair = {root, q};
     return return_pair;
 }
+
+#ifdef gmp
+u64_pair get_rq_gmp(u64 N, const u64* exp_start, const u64* exp_end, int thread_num) {
+    // Calculate modulo 2^64 multiplicative inverse of N
+    u128 Ni_64 = (N * 3) ^ 2;
+    u128 y = 1 - Ni_64 * N;
+
+    // Four steps are required to guarantee 64 bits
+    Ni_64 *= 1 + y;
+    y *= y;
+    Ni_64 *= 1 + y;
+    y *= y;
+    Ni_64 *= 1 + y;
+    y *= y;
+    Ni_64 *= 1 + y;
+
+    // Calculate 2^128 mod N
+    u64 r128_N = 1 + (u128) -1 % N;
+
+    // Get the minimum primitive root of N
+    u64 root = get_min_pr(N, Ni_64, r128_N, exp_start, exp_end);
+
+    // Set up pointers to this thread's GMP integers
+    mpz_t* m1 = &mpz_shared[2 * thread_num];
+    mpz_t* m2 = m1 + 1;
+
+    // Use GMP to calculate q = (root ^ N % N^2 - root) / N
+    mpz_set_ui(*m1, root);
+    mpz_set_ui(*m2, N);
+    mpz_mul_ui(*m2, *m2, N);
+    mpz_powm_ui(*m1, *m1, N, *m2);
+    mpz_sub_ui(*m1, *m1, root);
+    mpz_divexact_ui(*m1, *m1, N);
+    u64 q = mpz_get_ui(*m1);
+
+#ifdef verbose
+    // Print "N (root q) factor_list" for debugging
+    #pragma omp critical
+    {
+        fprintf(stderr, "%lu (%lu %lu)", N, root, q);
+        for (int i = 0; i < exp_end - exp_start; ++i)
+            fprintf(stderr, " %lu", (N - 1) / *(exp_start + i));
+        fprintf(stderr, "\n");
+    }
+#endif
+
+    u64_pair return_pair = {root, q};
+    return return_pair;
+}
+#endif
 
 // Thread entry point. Sieves primes, allcates exp vectors, calls the functions above
 void count_qvals(const u64 chunk_num) {
@@ -673,35 +750,35 @@ void count_qvals(const u64 chunk_num) {
     if (gp_pairs[0] > 2 && gp_pairs[gp_pairs[0] - 2] < 2 * chunk_start)
         gp_thread_max = gp_pairs[gp_pairs[0] - 1];
 
-    #ifdef verbose
+#ifdef verbose
     #pragma omp critical
     {
         fprintf(stderr, "Thread %i (chunk %lu): Sieving\n", thread_num, chunk_num);
         fflush(stderr);
     }
-    #endif
+#endif
 
     // Sieve out composite N (2n+1) values by setting valid[] values to zero
     prime_sieve(chunk_start, valid);
 
-    #ifdef verbose
+#ifdef verbose
     #pragma omp critical
     {
         fprintf(stderr, "Thread %i (chunk %lu): Factoring\n", thread_num, chunk_num);
         fflush(stderr);
     }
-    #endif
+#endif
 
     // Fill vectors with (N-1)/p values for each prime number N
     gen_exp_vectors(chunk_start, valid, vectors, vector_vals);
 
-    #ifdef verbose
+#ifdef verbose
     #pragma omp critical
     {
         fprintf(stderr, "Thread %i (chunk %lu): Getting MPRs\n", thread_num, chunk_num);
         fflush(stderr);
     }
-    #endif
+#endif
 
     // Get first primitive root of each prime N and calculate q
     for (j = 0; j < chunk_size; ++j) {
@@ -730,7 +807,11 @@ void count_qvals(const u64 chunk_num) {
         }
 
         // Calculate the minimum primitive root and q value
+#ifdef gmp
+        rq = get_rq_gmp(N, exp_start, exp_end, thread_num);
+#else
         rq = get_rq(N, exp_start, exp_end);
+#endif
         root = rq.root;
         q_val = rq.q_val;
 
@@ -753,10 +834,10 @@ void count_qvals(const u64 chunk_num) {
         if (root <= gp_thread_max)
             continue;
 
-        #ifdef verbose
+#ifdef verbose
         #pragma omp critical
             fprintf(stderr, "New maximum root for g(p): %lu (%lu)\n", root, N);
-        #endif
+#endif
 
         // Reallocate g(p) array if size == capacity
         if (gp_pairs[0] == gp_pairs[1]) {
@@ -773,13 +854,13 @@ void count_qvals(const u64 chunk_num) {
         gp_thread_max = root;
     }
 
-    #ifdef verbose
+#ifdef verbose
     #pragma omp critical
     {
         fprintf(stderr, "Thread %i (chunk %lu): Done\n", thread_num, chunk_num);
         fflush(stderr);
     }
-    #endif
+#endif
 }
 
 // Main entry point. Reads in start, block_size and chunk_size from argv, then splits
@@ -865,13 +946,13 @@ int main(int argc, char **argv) {
         else if (block_size == 499999995)
             chunk_size = 49995;
 
-        //For 10 million or less, just use a single thread
-        else if (block_size < 5000000)
+        //For less than 1 billion, just use a single thread
+        else if (block_size < 499999995)
             chunk_size = block_size;
 
         // Otherwise exit
         else {
-            fprintf(stderr, "start_value must be >=10, OR use total_size of 1e9, 1e12, or <=1e7\n");
+            fprintf(stderr, "start_value must be >=10, OR use total_size of 1e12, or <=1e9\n");
             return 1;
         }
 
@@ -886,7 +967,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Set distribution output file name
+    // Set q/N distribution output file name
     char dist_fname[32];
     if (N_max >= 1000000000000)
         snprintf(dist_fname, sizeof(dist_fname), "output/%05lue12-to-%05lue12.csv",
@@ -928,6 +1009,13 @@ int main(int argc, char **argv) {
     vector_vals_shared = (u64*) aligned_alloc(64, max_threads * vector_vals_size * sizeof(u64));
     qcounts_shared = (u64*) calloc(max_threads * BIN_COUNT, sizeof(u64));
 
+#ifdef gmp
+    // Allocate and initialize two mpz variables for each thread
+    mpz_shared = (mpz_t*) malloc(2 * max_threads * sizeof(mpz_t));
+    for (i = 0; i < 2 * max_threads; ++i)
+        mpz_init(mpz_shared[i]);
+#endif
+
     // Exit now if any of these big allocation(s) failed
     if (!qcounts_shared || !valid_shared || !vectors_shared || !vector_vals_shared) {
         fprintf(stderr, "Error: couldn't allocate necessary memory (%lu GiB)\n", req_mem >> 30);
@@ -966,7 +1054,7 @@ int main(int argc, char **argv) {
         for (i = 1; i < max_threads; ++i)
             qcounts_shared[j] += (qcounts_shared + i * BIN_COUNT)[j];
 
-        if (argv[1][0] == 'c')
+        if (output_format == 'c')
             fprintf(dist_file, "%lu,", qcounts_shared[j]);
         else
             fprintf(dist_file, "0.%03lu: %lu\n", j, qcounts_shared[j]);
@@ -992,6 +1080,13 @@ int main(int argc, char **argv) {
     fclose(gpms_file);
     fclose(dist_file);
     fclose(ngps_file);
+
+#ifdef gmp
+    // Clear and free mpz variables
+    for (i = 0; i < 2 * max_threads; ++i)
+        mpz_clear(mpz_shared[i]);
+    free(mpz_shared);
+#endif
 
     // Garbage collect
     free(gp_pairs_shared);
