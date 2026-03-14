@@ -7,10 +7,9 @@ if [ "$ngpid" != "" ]; then
 		kill $ngpid
 		kill $(pgrep ngp-bin)
 		echo "NGP program stopped"
-		exit
-	fi
-
-	echo "Already running [$ngpid] (use argument 'stop' to stop)"
+    else
+        echo "Already running [$ngpid] (use argument 'stop' to stop)"
+    fi
 	exit
 
 elif [ "$1" == "stop" ]; then
@@ -18,10 +17,10 @@ elif [ "$1" == "stop" ]; then
     exit
 fi
 
-# Make output directory
-outdir="./output"
-if [ ! -d $outdir ]; then
-    mkdir $outdir
+# Run make only if binaries are not found
+if [[ ! -f ngp-bin || ! -f psieve ]]; then
+    echo "Compiling executables"
+    make
 fi
 
 # Run 32-bit prime sieve if needed
@@ -30,32 +29,59 @@ if [ ! -f primes.dat ]; then
     ./psieve
 fi
 
+# Make output directory if needed
+outdir="./output"
+if [ ! -d $outdir ]; then
+    mkdir $outdir
+fi
+
+# Get initial g(p) maximum from end of gp-max file
+gp_max_file="output/gp-max.csv"
+if [ ! -f $gp_max_file ]; then
+    gp_max="3"
+else
+    gp_max=$(tail -n 1 $gp_max_file | cut -d ',' -f 2)
+fi
+
 # Get input from user prompts or from args
-if [ "$#" -ne "5" ]; then
+if [ $# -ne 6 ]; then
     read -p "Starting value      : " var[0]
     read -p "Stopping value      : " var[1]
     read -p "Thread Chunk Size   : " var[2]
     read -p "Write to file every : " var[3]
+    echo " Current g(p) max = ${gp_max}. Type in a value"
+    echo " to override it, or press enter to keep it."
+    read -p "override g(p) max   : " var[4]
     read -p "Log file path       : " logfile
 else
     var[0]=$1
     var[1]=$2
     var[2]=$3
     var[3]=$4
-    logfile=$5
+    var[4]=$5
+    logfile=$6
 fi
 
 # Convert scientific notation to integers
-for i in {0..3}; do
+for i in {0..2}; do
     var[i]=$(python3 -c "print(int(${var[i]}))")
 done
 
-# If write size input was zero, just use entire set (write once)
-if [[ var[3] -eq 0 ]]; then
+# If write size input was blank, just use entire set (write once)
+if [ "${var[3]}" == "" ]; then
     var[3]=$((var[1] - var[0]))
+
+# Otherwise convert value to integer in the same manner as the others
+else
+    var[3]=$(python3 -c "print(int(${var[3]}))")
+fi
+
+# If g(p) input was blank, just use gp_max from file
+if [ "${var[4]}" == "" ]; then
+    var[4]=$gp_max
 fi
 
 # Dispatch looping shell script via nohup, then print process
-nohup "./ngp-loop.sh" ${var[0]} ${var[1]} ${var[2]} ${var[3]} $logfile >> $logfile 2>&1 &
+nohup "./ngp-loop.sh" ${var[0]} ${var[1]} ${var[2]} ${var[3]} ${var[4]} $logfile >> $logfile 2>&1 &
 ngpid=$(pgrep -f "ngp-loop.sh ")
-echo "[$ngpid]"
+echo "Process ID: [$ngpid]"
